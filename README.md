@@ -11,6 +11,10 @@ capital per trade**, and cross-checks every signal with **market sentiment**
 (Fear & Greed index, CoinGecko trending, CryptoPanic, X). A **real-time web
 dashboard** shows every decision it takes.
 
+> **New:** an investment version for **stocks & ETPs (no crypto)**, starting with
+> 100 €, with the list of platforms that accept bots in France →
+> [README_INVEST.md](README_INVEST.md).
+
 > [!WARNING]
 > **This is not financial advice.** It is a learning project, still imperfect.
 > Leveraged trading can wipe out the whole capital very quickly. Read the code,
@@ -155,6 +159,12 @@ which keeps API usage tiny.
 ├── dashboard/
 │   ├── dashboard.py       # Real-time web interface (read-only)
 │   └── static/index.html
+├── invest/                # Investment bot: US stocks + 3x ETP, 100 €, no crypto
+│   ├── invest_bot.py      #   main loop (simulator, Trading 212, IBKR, Alpaca)
+│   ├── engine.py          #   daily decisions shared by live and backtest
+│   ├── signals.py         #   momentum ranking, regime, the 7 conditions
+│   ├── brokers/           #   sim, trading212, alpaca, ibkr adapters
+│   └── tax.py             #   French tax ledger (PMP in EUR, 2074 / 3VG)
 ├── legacy/
 │   └── trading_bot_v1_spot.py  # v1: BTC only, spot, no leverage
 ├── tests/                 # pytest suite (no network needed)
