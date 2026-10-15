@@ -1,0 +1,30 @@
+# Secrets
+.env
+*.pem
+
+# Bot state, journals and logs
+state/
+state_*/
+state_v1.json
+*.log
+*.tmp
+
+# Backtests and downloaded market data
+backtest_results/
+data/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.venv/
+venv/
+*.egg-info/
+build/
+dist/
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store
