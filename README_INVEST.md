@@ -158,6 +158,36 @@ INV_T212_TERMS_ACKNOWLEDGED=true python -m invest.invest_bot --broker trading212
 
 Keep one state directory per broker and environment: the bot refuses to mix them.
 
+### Real-money safety rules built in
+
+- Live trading stays locked until `INV_LIVE_TRADING=I_UNDERSTAND_THE_RISKS` (or
+  `--i-understand-the-risks`). Trading 212 live also needs
+  `INV_T212_TERMS_ACKNOWLEDGED=true`.
+- Every position gets a stop resting at the broker. The stop is cancelled in two
+  phases: the bot asks for the cancellation and waits for the broker's
+  confirmation before selling or placing a new stop. Brokers lock shares under a
+  pending stop, and on IBKR a sell racing a stop fill could go short.
+- An order whose submission timed out is looked up at the broker, never sent
+  twice. Partial fills are booked and protected at once.
+- Entries planned for a past session are dropped. A position counts as "closed
+  by hand" only after two consecutive checks.
+- Survival rule:
+  - a single bad intraday reading cannot kill the bot: two are needed;
+  - at death it cancels working buys and liquidates;
+  - it keeps reconciling the liquidation until the account is flat, even after a
+    restart, and then refuses to run.
+- Stock splits are detected in the data cache, and open positions are rescaled.
+
+**Leveraged ETP with a real broker.** EU retail cannot buy US-domiciled ETFs, so
+pick an EU-listed 2x/3x product your broker offers, and pass its appropriateness
+test in the app. Then set three variables:
+- `INV_ETP_BROKER_TICKER`: the instrument (Trading 212 ticker, or
+  `SYMBOL:EXCHANGE:CURRENCY` for IBKR);
+- `INV_ETP_PRICE_SYMBOL`: its Alpha Vantage symbol, used for the daily prices;
+- `INV_ETP_CURRENCY`: its currency.
+
+Without them the sleeve only runs in the simulator. Alpaca has no EU ETPs.
+
 ## 5. French tax: what you must do
 
 The bot keeps `state_invest/tax_ledger.jsonl` (every fill in EUR, PMP cost basis):
