@@ -334,7 +334,7 @@ function renderSentiment(s) {
   const m = s.sentiment || {};
   const gauge = m.gauge || (m.fear_greed ? {value: m.fear_greed.value, label: "Fear & Greed",
     classification: m.fear_greed.classification, higher_is_bullish: true} : null);
-  if (m.enabled === false) {
+  if (m.enabled === false && !gauge) {
     $("fng").textContent = "off";
     $("fng-label").textContent = "sentiment filter disabled";
   } else if (gauge) {
@@ -379,7 +379,8 @@ function renderPositions(positions, marks) {
   body.replaceChildren(...positions.map((p) => {
     const mark = marks[p.symbol];
     const dir = p.side === "LONG" ? 1 : -1;
-    const upnl = mark ? dir * (mark - p.entry_price) * p.qty : null;
+    const upnl = p.unrealized_eur !== undefined && p.unrealized_eur !== null
+      ? p.unrealized_eur : (mark ? dir * (mark - p.entry_price) * p.qty : null);
     return row([
       {text: p.symbol}, {text: p.side, cls: p.side === "LONG" ? "pos" : "neg"},
       {text: "x" + p.leverage, cls: "num"}, {text: px(p.qty), cls: "num"},

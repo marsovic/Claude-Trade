@@ -105,7 +105,11 @@ class BotState:
 
 
 class StateStore:
-    def __init__(self, state_dir: str | Path):
+    """``state_cls`` lets another bot persist its own state type (needs
+    ``from_dict``/``to_dict``) while sharing the journals and the tombstone."""
+
+    def __init__(self, state_dir: str | Path, state_cls=None):
+        self.state_cls = state_cls or BotState
         self.dir = Path(state_dir)
         self.dir.mkdir(parents=True, exist_ok=True)
         self.state_path = self.dir / "state.json"
@@ -114,13 +118,14 @@ class StateStore:
         self.tombstone_path = self.dir / "TOMBSTONE.json"
 
     # ------------------------------------------------------------ snapshot
-    def load(self) -> BotState | None:
+    def load(self):
         if not self.state_path.exists():
             return None
-        return BotState.from_dict(json.loads(self.state_path.read_text()))
+        return self.state_cls.from_dict(json.loads(self.state_path.read_text()))
 
-    def save(self, state: BotState) -> None:
-        _atomic_write(self.state_path, json.dumps(state.to_dict(), separators=(",", ":")))
+    def save(self, state) -> None:
+        _atomic_write(self.state_path, json.dumps(state.to_dict(), separators=(",", ":"),
+                                                  default=_json_default))
 
     # ------------------------------------------------------------- journals
     def log_decision(self, kind: str, message: str, symbol: str | None = None,
@@ -150,6 +155,13 @@ class StateStore:
         _atomic_write(self.tombstone_path, json.dumps(info, indent=2))
 
 
+def _json_default(obj):
+    """numpy scalars (np.bool_, np.float64...) -> plain Python values."""
+    if hasattr(obj, "item"):
+        return obj.item()
+    raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
+
+
 def _atomic_write(path: Path, text: str) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(text)
@@ -158,7 +170,9 @@ def _atomic_write(path: Path, text: str) -> None:
 
 def _append_line(path: Path, obj: dict) -> None:
     with path.open("a", encoding="utf-8") as fh:
-        fh.write(json.dumps(obj, separators=(",", ":"), default=str) + "\n")
+        fh.write(json.dumps(obj, separators=(",", ":"),
+                            default=lambda o: o.item() if hasattr(o, "item") else str(o))
+                 + "\n")
 
 
 def _tail_lines(path: Path, n: int, block: int = 65536) -> list[str]:
