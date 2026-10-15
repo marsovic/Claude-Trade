@@ -12,6 +12,7 @@ from invest.engine import Engine
 from invest.execution import LiveExecution
 from invest.invest_bot import EXIT_DEAD, BotIsDead, InvestBot, main
 from invest.portfolio import InvestPosition, InvestState
+from invest.tax import TaxLedger
 from tests.invest_helpers import SYMS, make_market, settings, signal_case
 
 
@@ -21,12 +22,14 @@ class FakeBroker(LiveBroker):
     def __init__(self, resting_stops=True):
         self.resting_stops = resting_stops
         self.fractional = True
-        self.orders = {}  # broker id -> dict
+        self.orders = {}  # broker id -> {"order", "status", "filled", "price"}
         self.positions = {}  # ticker -> qty
         self.cancelled = []
         self.equity = 100.0
         self.cash = 100.0
         self.next_id = 1
+        self.raise_next = None  # exception raised by the next submit
+        self.record_anyway = False  # ...while the order still reaches the broker
 
     def resolve(self, symbol):
         return None if symbol == "UNTRADABLE" else f"{symbol}_US_EQ"
@@ -36,30 +39,45 @@ class FakeBroker(LiveBroker):
             t: BrokerPosition(t, q, 100.0, 105.0) for t, q in self.positions.items() if q > 0})
 
     def submit(self, order):
+        exc, self.raise_next = self.raise_next, None
+        if exc is not None and not self.record_anyway:
+            raise exc
         bid = str(self.next_id)
         self.next_id += 1
-        self.orders[bid] = {"order": order, "status": "pending"}
+        self.orders[bid] = {"order": order, "status": "pending", "filled": 0.0, "price": 0.0}
+        if exc is not None:
+            raise exc
         return bid
+
+    def find(self, order, submitted_at):
+        for bid, rec in self.orders.items():
+            if rec["order"].id == order.id:
+                return bid
+        return None
 
     def cancel(self, broker_id):
         self.cancelled.append(broker_id)
-        if broker_id in self.orders and self.orders[broker_id]["status"] == "pending":
+        if broker_id in self.orders and self.orders[broker_id]["status"] in (
+                "pending", "partially_filled"):
             self.orders[broker_id]["status"] = "cancelled"
 
-    def fill(self, bid, price):
-        o = self.orders[bid]["order"]
-        self.orders[bid].update(status="filled", price=price)
+    def fill(self, bid, price, qty=None):
+        rec = self.orders[bid]
+        o = rec["order"]
+        qty = o.qty - rec["filled"] if qty is None else qty
+        rec["filled"] += qty
+        rec["price"] = price
+        rec["status"] = "filled" if rec["filled"] >= o.qty - 1e-9 else "partially_filled"
         sign = 1 if o.side == "BUY" else -1
-        self.positions[o.broker_ticker] = self.positions.get(o.broker_ticker, 0) + sign * o.qty
+        self.positions[o.broker_ticker] = self.positions.get(o.broker_ticker, 0) + sign * qty
 
     def order_update(self, order):
         rec = self.orders.get(order.broker_id)
         if rec is None:
             return OrderUpdate("unknown")
-        if rec["status"] == "filled":
-            return OrderUpdate("filled", rec["order"].qty, rec["price"], 0.05,
-                               1_760_000_000_000)
-        return OrderUpdate(rec["status"])
+        return OrderUpdate(rec["status"], rec["filled"], rec["price"],
+                           0.05 if rec["filled"] else 0.0,
+                           1_760_000_000_000 if rec["filled"] else 0)
 
     def by_kind(self, kind, status="pending"):
         return [b for b, r in self.orders.items()
@@ -73,7 +91,7 @@ def live_engine(tmp_path, broker=None, **kw):
     store = StateStore(tmp_path, InvestState)
     broker = broker or FakeBroker()
     ex = LiveExecution(s, state, store, broker, clock=lambda: 1_760_000_000)
-    engine = Engine(s, state, store, ex)
+    engine = Engine(s, state, store, ex, ledger=TaxLedger(tmp_path))
     return engine, ex, broker, state, store
 
 
@@ -111,7 +129,11 @@ def test_exit_cancels_stop_before_selling(tmp_path):
     stop_bid = broker.by_kind("STOP")[0]
     engine._exit("AMD", pos, "rank exit", pd.Timestamp("2026-10-14"))
     ex.submit_planned(engine)
-    assert stop_bid in broker.cancelled  # shares unlocked before the market sell
+    assert stop_bid in broker.cancelled  # shares unlocked before the market sell...
+    assert broker.by_kind("MARKET") == []  # ...but nothing sold until it is confirmed
+    assert state.pending and state.pending[0]["side"] == "SELL"
+    ex.submit_planned(engine)  # next cycle: the cancellation is confirmed -> sell
+    assert broker.by_kind("STOP") == []  # no new stop placed in between
     sell = broker.by_kind("MARKET")[0]
     broker.fill(sell, 110.0)
     ex.sync(engine)
@@ -130,6 +152,8 @@ def test_stale_entry_cancelled_and_manual_close_detected(tmp_path):
     state.positions["ZZZ"] = pos  # but the broker does not hold it any more
     ex.settle(engine, day, MarketData(bars=bars))
     assert broker.by_kind("LIMIT", "cancelled")  # unfilled entry cancelled at the close
+    assert "ZZZ" in state.positions  # one missing reading only raises a warning
+    ex.settle(engine, day, MarketData(bars=bars))
     assert "ZZZ" not in state.positions
     assert store.recent_trades()[-1]["reason"] == "closed outside the bot"
 

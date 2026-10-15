@@ -80,7 +80,7 @@ class IbkrBroker(LiveBroker):
                 if (tag, cur) in values:
                     return float(values[(tag, cur)])
             usd = values.get((tag, "USD"))
-            return float(usd) / self.fx() if usd is not None else 0.0
+            return float(usd) / self.fx() if usd is not None else None  # unknown, not 0
 
         positions = {}
         for item in self.ib.portfolio():
@@ -125,20 +125,28 @@ class IbkrBroker(LiveBroker):
     def begin_sync(self) -> None:
         self.ib.sleep(0.5)  # let ib_async process pending events
 
+    def _from_executions(self, order: OrderRequest) -> OrderUpdate:
+        fills = [f for f in self.ib.reqExecutions()
+                 if getattr(f.execution, "orderRef", "") == order.id]
+        qty = sum(f.execution.shares for f in fills)
+        if not fills or qty <= 0:
+            return OrderUpdate("unknown")
+        avg = sum(f.execution.shares * f.execution.price for f in fills) / qty
+        fees = sum(f.commissionReport.commission for f in fills) / self.fx()
+        return OrderUpdate("filled", qty, avg, fees, int(fills[-1].time.timestamp() * 1000))
+
+    def find(self, order: OrderRequest, submitted_at: int) -> str | None:
+        trade = self._trade(order)
+        return str(trade.order.orderId) if trade is not None else None
+
     def order_update(self, order: OrderRequest) -> OrderUpdate:
         trade = self._trade(order)
         if trade is None:
-            # Not in this session's trades: look at today's executions.
-            fills = [f for f in self.ib.reqExecutions()
-                     if getattr(f.execution, "orderRef", "") == order.id]
-            if not fills:
-                return OrderUpdate("unknown")
-            qty = sum(f.execution.shares for f in fills)
-            avg = sum(f.execution.shares * f.execution.price for f in fills) / qty
-            fees = sum(f.commissionReport.commission for f in fills) / self.fx()
-            return OrderUpdate("filled", qty, avg, fees,
-                               int(fills[-1].time.timestamp() * 1000))
+            return self._from_executions(order)  # e.g. after a reconnect
         status = STATUS.get(trade.orderStatus.status, "unknown")
+        if status == "filled" and (trade.orderStatus.filled <= 0
+                                   or trade.orderStatus.avgFillPrice <= 0):
+            return self._from_executions(order)  # restored trade without fill details
         fees = sum(f.commissionReport.commission for f in trade.fills) / self.fx()
         when = trade.fills[-1].time if trade.fills else None
         if status == "pending" and trade.orderStatus.filled > 0:

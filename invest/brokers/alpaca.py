@@ -85,13 +85,14 @@ class AlpacaBroker(LiveBroker):
                 "qty": f"{order.qty:.6f}".rstrip("0").rstrip("."),
                 "side": order.side.lower(), "time_in_force": "day",
                 "client_order_id": order.id}
-        if order.kind == "LIMIT" and whole:
+        if order.kind == "LIMIT":
+            # Fractional limit orders are accepted with time_in_force=day.
             body.update(type="limit", limit_price=f"{order.limit_price:.2f}")
         elif order.kind == "STOP" and whole:
             body.update(type="stop", stop_price=f"{order.stop_price:.2f}", time_in_force="gtc")
+        elif order.kind == "STOP":
+            raise BrokerError("fractional stops cannot rest at Alpaca: watched by the bot")
         else:
-            if order.kind != "MARKET":
-                log.info("%s: fractional %s order sent as market", order.symbol, order.kind)
             body["type"] = "market"
         resp = self._request("POST", "/orders", json=body)
         return str(resp["id"])
@@ -108,6 +109,14 @@ class AlpacaBroker(LiveBroker):
                            avg_price=float(row.get("filled_avg_price") or 0),
                            filled_at=int(pd.Timestamp(filled_at).timestamp() * 1000)
                            if filled_at else 0)
+
+    def find(self, order: OrderRequest, submitted_at: int) -> str | None:
+        try:
+            row = self._request("GET", "/orders:by_client_order_id",
+                                params={"client_order_id": order.id})
+        except BrokerError:
+            return None
+        return str(row["id"]) if row and row.get("id") else None
 
     def preflight(self) -> list[str]:
         acct = self._request("GET", "/account")

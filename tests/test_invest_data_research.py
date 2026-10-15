@@ -97,21 +97,30 @@ def test_tiingo_adjusted_prices():
 
 
 class FakeProvider(BarProvider):
+    """Close 1.0 until 2026-10-12, then 2.0; ``split`` divides the past by 10."""
+
     name = "fake"
     supports_grouped = True
 
-    def __init__(self):
+    def __init__(self, split=False):
         self.history_calls, self.grouped_calls = [], []
+        self.split = split
+
+    def _price(self, day):
+        past = 1.0 / (10 if self.split else 1)
+        return past if pd.Timestamp(day) <= pd.Timestamp("2026-10-12") else 2.0
 
     def history(self, symbol, start, end):
         self.history_calls.append(symbol)
-        idx = pd.bdate_range(start, "2026-10-12")
-        return pd.DataFrame({"open": 1.0, "high": 1.0, "low": 1.0, "close": 1.0,
+        idx = pd.bdate_range(start, end)
+        closes = [self._price(d) for d in idx]
+        return pd.DataFrame({"open": closes, "high": closes, "low": closes, "close": closes,
                              "volume": 1.0}, index=idx)
 
     def grouped(self, day):
         self.grouped_calls.append(day)
-        return {"AMD": {"open": 2, "high": 2, "low": 2, "close": 2, "volume": 2}}
+        c = self._price(day)
+        return {"AMD": {"open": c, "high": c, "low": c, "close": c, "volume": 2}}
 
 
 def test_barstore_full_then_incremental(tmp_path):
@@ -121,8 +130,20 @@ def test_barstore_full_then_incremental(tmp_path):
     assert p.history_calls == ["AMD"] and (tmp_path / "bars" / "AMD.csv").exists()
     frames = store.update(["AMD"], date(2026, 10, 14))
     assert p.history_calls == ["AMD"]  # no second full download
-    assert p.grouped_calls == [date(2026, 10, 13), date(2026, 10, 14)]
-    assert frames["AMD"]["close"].iloc[-1] == 2
+    # one overlap check on the last cached day, then the two new days
+    assert p.grouped_calls == [date(2026, 10, 12), date(2026, 10, 13), date(2026, 10, 14)]
+    assert frames["AMD"]["close"].iloc[-1] == 2 and store.splits == {}
+
+
+def test_barstore_detects_split_and_reloads_history(tmp_path):
+    p = FakeProvider()
+    store = BarStore(tmp_path, p, history_days=60)
+    store.update(["AMD"], date(2026, 10, 12))
+    p.split = True  # the provider now reports past prices divided by 10
+    frames = store.update(["AMD"], date(2026, 10, 14))
+    assert p.history_calls == ["AMD", "AMD"]  # history downloaded again
+    assert store.splits == {"AMD": ("2026-10-13", 10.0)}
+    assert frames["AMD"]["close"].loc["2026-10-12"] == pytest.approx(0.1)
 
 
 def test_fred_csv_both_header_styles_and_ecb():

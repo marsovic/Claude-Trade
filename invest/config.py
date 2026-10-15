@@ -37,7 +37,6 @@ SECRET_ENV = {
     "alphavantage_api_key": "ALPHAVANTAGE_API_KEY",
     "fred_api_key": "FRED_API_KEY",
     "sec_user_agent": "SEC_USER_AGENT",
-    "live_trading": "LIVE_TRADING",
 }
 
 
@@ -163,6 +162,7 @@ class InvestSettings:
     etp_vix_exit: float = 28.0
     etp_broker_ticker: str = ""  # real brokers: instrument to trade (e.g. T212 ticker)
     etp_price_symbol: str = ""  # real brokers: Alpha Vantage symbol for its daily prices
+    etp_currency: str = "EUR"  # real brokers: currency of the traded ETP line
 
     # --- Sentiment / research ------------------------------------------------------
     sentiment_enabled: bool = True
@@ -257,7 +257,7 @@ class InvestSettings:
             raise ConfigError("Alpaca needs ALPACA_API_KEY and ALPACA_API_SECRET")
         if self.is_live and self.live_trading != LIVE_CONFIRMATION:
             raise ConfigError(
-                "Real-money trading is locked. Set LIVE_TRADING="
+                "Real-money trading is locked. Set INV_LIVE_TRADING="
                 f"{LIVE_CONFIRMATION} (or --i-understand-the-risks) only after "
                 "backtests and several weeks of paper trading.")
         if self.broker == "trading212" and self.is_live and not self.t212_terms_acknowledged:
@@ -270,7 +270,7 @@ class InvestSettings:
         out = {}
         for f in fields(self):
             value = getattr(self, f.name)
-            if f.name in SECRET_ENV and f.name != "live_trading":
+            if f.name in SECRET_ENV:
                 value = bool(value)
             out[f.name] = value
         out.update({
@@ -281,6 +281,10 @@ class InvestSettings:
             "max_open_positions": self.slots + (1 if self.etp_enabled else 0),
         })
         return out
+
+
+def etp_symbol(s: InvestSettings) -> str:
+    return f"ETP:{s.etp_underlying}x{s.etp_leverage:g}"
 
 
 def venue_label(s: InvestSettings) -> str:

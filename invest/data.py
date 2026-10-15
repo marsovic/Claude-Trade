@@ -284,6 +284,16 @@ class BarStore:
         tmp.replace(self.path(symbol))
 
     def update(self, symbols: list[str], end: date) -> dict[str, pd.DataFrame]:
+        """Refresh the cache up to ``end``.
+
+        Providers return prices adjusted for splits *as of today*, so after a
+        split the cached history no longer matches. The last cached bar is
+        compared with the provider's current value; on a mismatch the symbol's
+        history is downloaded again, and a split-like ratio (e.g. 10 for a
+        10-for-1 split) is reported in ``self.splits`` so open positions can be
+        rescaled.
+        """
+        self.splits: dict[str, tuple[str, float]] = {}
         start_full = end - timedelta(days=self.history_days)
         frames = {s: self.load(s) for s in symbols}
         need_full = [s for s, f in frames.items() if f.empty or f.index[0].date() > start_full
@@ -292,29 +302,60 @@ class BarStore:
             log.info("downloading %d symbols of history from %s", len(need_full),
                      self.provider.name)
             for sym, df in self.provider.history_many(need_full, start_full, end).items():
-                frames[sym] = normalise(pd.concat([df, frames.get(sym, empty_frame())]))
+                frames[sym] = normalise(pd.concat([frames.get(sym, empty_frame()), df]))
         stale = [s for s, f in frames.items() if s not in need_full and not f.empty
                  and f.index[-1].date() < end]
         if stale:
-            oldest = min(frames[s].index[-1].date() for s in stale)
+            last = {sym: frames[sym].index[-1] for sym in stale}
+            oldest = min(d.date() for d in last.values())
             days = [oldest + timedelta(days=i) for i in range(1, (end - oldest).days + 1)]
             days = [d for d in days if d.weekday() < 5]
+            mismatch: dict[str, float] = {}
             if self.provider.supports_grouped and len(days) <= 15:
+                for check in sorted({d.date() for d in last.values()}):
+                    rows = self.provider.grouped(check) or {}
+                    for sym in stale:
+                        if last[sym].date() == check and sym in rows:
+                            self._compare(sym, frames[sym], rows[sym]["close"], mismatch)
                 for day in days:
                     rows = self.provider.grouped(day) or {}
                     for sym in stale:
-                        if sym in rows and frames[sym].index[-1].date() < day:
+                        if sym in rows and sym not in mismatch \
+                                and frames[sym].index[-1].date() < day:
                             new = pd.DataFrame([rows[sym]], index=pd.to_datetime([day]))
                             frames[sym] = normalise(pd.concat([frames[sym], new]))
             else:
                 for sym, df in self.provider.history_many(stale, oldest, end).items():
-                    frames[sym] = normalise(pd.concat([frames[sym], df]))
+                    if last[sym] in df.index:
+                        self._compare(sym, frames[sym], float(df.loc[last[sym], "close"]),
+                                      mismatch)
+                    if sym not in mismatch:
+                        frames[sym] = normalise(pd.concat([frames[sym], df]))
+            if mismatch:
+                log.warning("price history changed for %s: downloading it again",
+                            ", ".join(sorted(mismatch)))
+                fresh = self.provider.history_many(sorted(mismatch), start_full, end)
+                for sym, df in fresh.items():
+                    if df.empty:
+                        continue
+                    new_days = df.index[df.index > last[sym]]
+                    ratio = mismatch[sym]
+                    if (ratio >= 1.4 or ratio <= 0.75) and len(new_days):
+                        self.splits[sym] = (str(new_days[0].date()), round(ratio, 4))
+                    frames[sym] = df
         cutoff = pd.Timestamp(start_full)
         for sym in symbols:
             frames[sym] = frames[sym][frames[sym].index >= cutoff]
             if not frames[sym].empty:
                 self.save(sym, frames[sym])
         return frames
+
+    @staticmethod
+    def _compare(sym: str, cached: pd.DataFrame, provider_close: float,
+                 mismatch: dict[str, float]) -> None:
+        old = float(cached["close"].iloc[-1])
+        if provider_close > 0 and abs(old / provider_close - 1) > 0.02:
+            mismatch[sym] = old / provider_close  # > 1: forward split, < 1: reverse
 
 
 # ============================================================ macro series
@@ -356,11 +397,33 @@ def ecb_eurusd(start: date, session: requests.Session | None = None) -> pd.Serie
     return series.dropna().sort_index()
 
 
+AV_URL = "https://www.alphavantage.co/query"
+
+
+def alphavantage_daily(symbol: str, api_key: str,
+                       session: requests.Session | None = None) -> pd.DataFrame:
+    """Last ~100 daily bars of any Alpha Vantage symbol (used for EU-listed ETPs)."""
+    session = session or requests.Session()
+    resp = session.get(AV_URL, params={"function": "TIME_SERIES_DAILY", "symbol": symbol,
+                                       "outputsize": "compact", "apikey": api_key},
+                       timeout=30)
+    resp.raise_for_status()
+    body = resp.json()
+    series = body.get("Time Series (Daily)")
+    if not series:
+        raise DataError(f"Alpha Vantage {symbol}: {str(body)[:150]}")
+    df = pd.DataFrame.from_dict(series, orient="index")
+    df = df.rename(columns={"1. open": "open", "2. high": "high", "3. low": "low",
+                            "4. close": "close", "5. volume": "volume"})
+    return normalise(df.astype(float))
+
+
 @dataclass
 class MarketData:
     """Everything the strategy reads for one decision (daily bars + macro)."""
 
     bars: dict[str, pd.DataFrame]
+    splits: dict[str, tuple[str, float]] = field(default_factory=dict)
     vix: pd.Series = field(default_factory=lambda: pd.Series(dtype=float))
     vix3m: pd.Series = field(default_factory=lambda: pd.Series(dtype=float))
     eurusd: pd.Series = field(default_factory=lambda: pd.Series(dtype=float))
@@ -382,6 +445,15 @@ def load_market_data(s, symbols: list[str], end: date, store: BarStore | None = 
                      session: requests.Session | None = None) -> MarketData:
     store = store or BarStore(s.data_dir, make_provider(s), s.history_days)
     bars = store.update(symbols, end)
+    splits = dict(getattr(store, "splits", {}))
+    if s.broker != "sim" and s.etp_enabled and s.etp_price_symbol and s.alphavantage_api_key:
+        from invest.config import etp_symbol
+
+        try:
+            bars[etp_symbol(s)] = alphavantage_daily(s.etp_price_symbol, s.alphavantage_api_key,
+                                                     session)
+        except Exception as exc:
+            log.warning("ETP prices unavailable (%s): no ETP decision today", exc)
     start = end - timedelta(days=s.history_days)
     macro = {}
     for name, loader in (("vix", lambda: fred_series("VIXCLS", start, s.fred_api_key, session)),
@@ -392,4 +464,4 @@ def load_market_data(s, symbols: list[str], end: date, store: BarStore | None = 
         except Exception as exc:  # macro data is optional; the bot degrades gracefully
             log.warning("%s unavailable: %s", name, exc)
             macro[name] = pd.Series(dtype=float)
-    return MarketData(bars=bars, eurusd_fallback=s.eurusd_fallback, **macro)
+    return MarketData(bars=bars, splits=splits, eurusd_fallback=s.eurusd_fallback, **macro)

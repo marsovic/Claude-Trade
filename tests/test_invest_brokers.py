@@ -146,11 +146,14 @@ def test_alpaca_order_and_account():
     frac = OrderRequest("AMD", "BUY", 0.25, kind="LIMIT", limit_price=201.0)
     assert b.submit(frac) == "abc"
     body = session.calls[-1][2]
-    assert body["type"] == "market" and body["qty"] == "0.25"  # fractional -> market
+    assert body["type"] == "limit" and body["qty"] == "0.25"  # gap cap kept
+    assert body["limit_price"] == "201.00" and body["time_in_force"] == "day"
     assert body["client_order_id"] == frac.id  # idempotent
-    whole = OrderRequest("AMD", "BUY", 2, kind="LIMIT", limit_price=201.0)
-    b.submit(whole)
-    assert session.calls[-1][2]["type"] == "limit"
+    with pytest.raises(BrokerError, match="fractional stops"):
+        b.submit(OrderRequest("AMD", "SELL", 0.25, kind="STOP", stop_price=190.0))
+    b.submit(OrderRequest("AMD", "SELL", 2, kind="STOP", stop_price=190.0))
+    assert session.calls[-1][2]["type"] == "stop"
+    assert session.calls[-1][2]["time_in_force"] == "gtc"
     upd = b.order_update(OrderRequest("AMD", "BUY", 0.25, broker_id="abc"))
     assert upd.status == "filled" and upd.avg_price == 200.0
     acct = b.account()

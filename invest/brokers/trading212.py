@@ -143,12 +143,15 @@ class Trading212Broker(LiveBroker):
         for row in self._request("GET", "/equity/positions", "positions") or []:
             inst = row.get("instrument", {})
             ticker = inst.get("ticker", "")
+            available = row.get("quantityAvailableForTrading")
             positions[ticker] = BrokerPosition(
                 ticker=ticker,
-                qty=float(row.get("quantityAvailableForTrading", row.get("quantity", 0)) or 0),
+                # Total quantity: shares under our own pending stop are still ours.
+                qty=float(row.get("quantity", 0) or 0),
                 avg_price=float(row.get("averagePricePaid", 0) or 0),
                 price=float(row.get("currentPrice", 0) or 0),
-                currency=inst.get("currency", "USD"))
+                currency=inst.get("currency", "USD"),
+                available=None if available is None else float(available))
         return AccountInfo(equity_eur=equity, cash_eur=cash_eur, positions=positions)
 
     # --------------------------------------------------------------- orders
@@ -225,6 +228,28 @@ class Trading212Broker(LiveBroker):
             if status in ("CANCELLED", "REJECTED"):
                 return OrderUpdate("cancelled" if status == "CANCELLED" else "rejected")
         return OrderUpdate("unknown")
+
+    def find(self, order: OrderRequest, submitted_at: int) -> str | None:
+        """Match a timed-out submission by ticker, signed quantity and type."""
+        qty = floor_qty(order.qty)
+        signed = qty if order.side == "BUY" else -qty
+        kind = {"MARKET": "MARKET", "LIMIT": "LIMIT", "STOP": "STOP"}[order.kind]
+
+        def same(o: dict) -> bool:
+            created = o.get("createdAt")
+            recent = not created or pd.Timestamp(created).timestamp() * 1000 >= \
+                submitted_at - 120_000
+            return (o.get("ticker") == order.broker_ticker and o.get("type") == kind
+                    and abs(float(o.get("quantity") or 0) - signed) < 1e-9 and recent)
+
+        for oid, o in self._pending.items():
+            if same(o):
+                return oid
+        for item in self._history_items():
+            o = item.get("order", {})
+            if same(o):
+                return str(o.get("id"))
+        return None
 
     def preflight(self) -> list[str]:
         warnings = []

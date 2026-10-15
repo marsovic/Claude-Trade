@@ -53,16 +53,17 @@ class Fill:
 @dataclass
 class BrokerPosition:
     ticker: str
-    qty: float
+    qty: float  # total quantity held (including shares locked by pending orders)
     avg_price: float
     price: float
     currency: str = "USD"
+    available: float | None = None  # quantity free to sell right now
 
 
 @dataclass
 class AccountInfo:
-    equity_eur: float
-    cash_eur: float
+    equity_eur: float | None  # None when the broker did not report it
+    cash_eur: float | None
     positions: dict[str, BrokerPosition] = field(default_factory=dict)
 
 
@@ -101,6 +102,10 @@ class LiveBroker:
 
     def order_update(self, order: OrderRequest) -> OrderUpdate:
         raise NotImplementedError
+
+    def find(self, order: OrderRequest, submitted_at: int) -> str | None:
+        """Broker id of an order whose submission timed out (None if not found)."""
+        return None
 
     def begin_sync(self) -> None:
         """Hook to batch the expensive calls of one synchronisation pass."""

@@ -34,6 +34,7 @@ class InvestPosition:
     broker_ticker: str = ""
     highest: float = 0.0
     initial_qty: float = 0.0
+    first_entry: float = 0.0  # price of the first fill: R stays anchored to it
     adds: int = 0
     stop_order_id: str = ""
     side: str = "LONG"
@@ -47,6 +48,8 @@ class InvestPosition:
             self.highest = self.entry_price
         if not self.initial_qty:
             self.initial_qty = self.qty
+        if not self.first_entry:
+            self.first_entry = self.entry_price
         if not self.last_price:
             self.last_price = self.entry_price
 
@@ -56,10 +59,20 @@ class InvestPosition:
 
     @property
     def r_distance(self) -> float:
-        return max(self.entry_price - self.initial_stop, 1e-12)
+        return max(self.first_entry - self.initial_stop, 1e-12)
 
     def r_multiple(self, price: float) -> float:
-        return (price - self.entry_price) / self.r_distance
+        """Move since the first entry, in units of the initial risk (adds do not
+        shrink R)."""
+        return (price - self.first_entry) / self.r_distance
+
+    def apply_split(self, ratio: float) -> None:
+        """``ratio`` new shares per old share (10 for a 10-for-1 split)."""
+        self.qty *= ratio
+        self.initial_qty *= ratio
+        for name in ("entry_price", "first_entry", "initial_stop", "stop_loss", "highest",
+                     "last_price", "atr"):
+            setattr(self, name, getattr(self, name) / ratio)
 
     def value_eur(self, price: float, usd_per_eur: float) -> float:
         rate = usd_per_eur if self.currency == "USD" else 1.0
@@ -139,6 +152,11 @@ class InvestState:
     settings: dict = field(default_factory=dict)
     broker_sync_ms: int = 0
     seen_fills: list[str] = field(default_factory=list)
+    missing_checks: dict[str, int] = field(default_factory=dict)  # "closed by hand?" checks
+    prev_close_equity: float = 0.0  # equity at the previous processed close
+    etp_anchor: list = field(default_factory=list)  # [day, price] of the synthetic ETP
+    floor_breaches: int = 0  # consecutive intraday readings below the survival floor
+    applied_splits: list[str] = field(default_factory=list)  # "SYM:YYYY-MM-DD"
 
     @classmethod
     def fresh(cls, mode: str, capital: float) -> InvestState:

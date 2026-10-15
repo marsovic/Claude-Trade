@@ -89,6 +89,7 @@ class InvestBot:
         self.engine: Engine | None = None
         self.execution = None
         self.running = True
+        self.winding_down = False
         self._next_daily_try = 0.0
 
     # ================================================================ setup
@@ -96,11 +97,16 @@ class InvestBot:
         return datetime.fromtimestamp(self.clock(), tz=ET)
 
     def setup(self) -> None:
-        tomb = self.store.tombstone()
-        if tomb:
-            raise BotIsDead(tomb)
         s = self.s
+        tomb = self.store.tombstone()
         state = self.store.load()
+        if tomb:
+            # A dead bot never trades again, but a real account must still be
+            # brought flat: finish the liquidation started at death.
+            if s.broker == "sim" or state is None or not (
+                    state.positions or state.pending or state.open_orders):
+                raise BotIsDead(tomb)
+            self.winding_down = True
         if state is None:
             state = InvestState.fresh(s.mode, s.initial_capital)
             self.store.log_decision("start", f"new life: {s.initial_capital:.2f} EUR, "
@@ -110,7 +116,7 @@ class InvestBot:
                               f"runs as {s.mode!r}: use another INV_STATE_DIR.")
         else:
             self.store.log_decision("start", f"resumed, {len(state.positions)} position(s)")
-        state.status = "running"
+        state.status = "dead" if self.winding_down else "running"
         state.universe = build_universe(s.universe or None, s.exclude)
         state.settings = s.public_dict()
         self.state = state
@@ -170,9 +176,15 @@ class InvestBot:
 
     # ============================================================= intraday
     def intraday(self, now: datetime) -> None:
-        if not isinstance(self.execution, LiveExecution) or not self.in_session(now):
+        if not isinstance(self.execution, LiveExecution):
             return
         ex, st = self.execution, self.state
+        if not self.in_session(now):
+            # Outside the session: confirm cancellations and re-place moved stops
+            # (brokers accept resting orders while the market is closed).
+            if ex.busy():
+                ex.sync(self.engine)
+            return
         if st.pending:
             ex.refresh_account()
             ex.submit_planned(self.engine)
@@ -182,9 +194,17 @@ class InvestBot:
         self.engine.mark(ex.broker_prices())
         ex.check_monitored_stops(self.engine, st.marks)
         equity = self.engine.equity(ex.broker_equity())
-        st.record_equity(int(self.clock() * 1000), equity)
-        if equity <= self.s.survival_floor:
-            self.engine.die(pd.Timestamp(now.date()), equity, int(self.clock() * 1000))
+        ts = int(self.clock() * 1000)
+        st.record_equity(ts, equity)
+        if equity > self.s.survival_floor:
+            st.floor_breaches = 0
+            return
+        st.floor_breaches += 1  # a single bad price print must not kill the bot
+        if st.floor_breaches >= 2:
+            self.engine.die(pd.Timestamp(now.date()), equity, ts)
+        else:
+            self.store.log_decision("warning", f"equity {equity:.2f} EUR at the survival "
+                                    "floor: confirming on the next check")
 
     # ================================================================= loop
     def cycle(self) -> bool:
@@ -202,8 +222,38 @@ class InvestBot:
         self.store.save(self.state)
         return self.state.status != "dead"
 
+    def wind_down(self, max_days: float = 5.0) -> int:
+        """After death: send and reconcile the liquidation until the account is flat."""
+        ex = self.execution
+        if not isinstance(ex, LiveExecution):
+            return EXIT_DEAD
+        deadline = self.clock() + max_days * 86400
+        log.critical("capital lost: liquidating, no new trade will ever be made")
+        while True:  # at least one step, even with max_days=0
+            try:
+                ex.cancel_entries(self.engine)
+                ex.submit_planned(self.engine)
+                ex.sync(self.engine)
+            except Exception as exc:  # keep trying: the account must end flat
+                log.exception("wind-down step failed: %s", exc)
+            self.state.heartbeat = int(self.clock() * 1000)
+            self.store.save(self.state)
+            if not (self.state.positions or self.state.pending or self.state.open_orders):
+                self.store.log_decision("stop", "liquidation complete: the bot is flat and "
+                                        "stops forever")
+                break
+            if not self.running or self.clock() >= deadline:
+                break
+            end = time.time() + self.s.poll_seconds
+            while self.running and time.time() < end:
+                time.sleep(min(1.0, end - time.time()))
+        self.store.save(self.state)
+        return EXIT_DEAD
+
     def run_forever(self) -> int:
         self.setup()
+        if self.winding_down:
+            return self.wind_down()
         log.info("invest bot started: %s, equity %.2f EUR, %d stocks", self.s.mode,
                  self.state.equity, len(self.state.universe))
         while self.running:
@@ -215,7 +265,7 @@ class InvestBot:
                 self._next_daily_try = self.clock() + 900
                 alive = True
             if not alive:
-                return EXIT_DEAD
+                return self.wind_down()
             end = time.time() + self.s.poll_seconds
             while self.running and time.time() < end:
                 time.sleep(min(1.0, end - time.time()))
@@ -226,6 +276,8 @@ class InvestBot:
 
     def run_once(self) -> int:
         self.setup()
+        if self.winding_down:
+            return self.wind_down(max_days=0)  # one liquidation step per run
         if isinstance(self.execution, LiveExecution):
             self.execution.sync(self.engine)
         self.daily_job()

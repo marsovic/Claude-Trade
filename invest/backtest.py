@@ -98,6 +98,10 @@ def run_backtest(bars: dict[str, pd.DataFrame], s: InvestSettings, start=None, e
                  eurusd: pd.Series | None = None, out_dir: str | Path | None = None
                  ) -> InvestBacktest:
     out_dir = Path(out_dir or tempfile.mkdtemp(prefix="invest_bt_"))
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for name in ("state.json", "decisions.jsonl", "trades.jsonl", "tax_ledger.jsonl",
+                 "TOMBSTONE.json"):
+        (out_dir / name).unlink(missing_ok=True)  # a re-run must not append to old results
     store = StateStore(out_dir, InvestState)
     state = InvestState.fresh("sim", s.initial_capital)
     universe = [u for u in build_universe(s.universe or None, s.exclude) if u in bars]
@@ -122,7 +126,9 @@ def run_backtest(bars: dict[str, pd.DataFrame], s: InvestSettings, start=None, e
         if state.status == "dead":
             break
     curve_s = pd.Series(curve, dtype=float)
-    bench = spy["close"].reindex(curve_s.index)
+    # Buy & hold SPY for a EUR investor: USD prices converted at each day's rate.
+    bench = pd.Series([spy.loc[d, "close"] / data.fx(d) for d in curve_s.index],
+                      index=curve_s.index, dtype=float)
     bench = bench / bench.iloc[0] * s.initial_capital if len(bench) else bench
     trades = store.recent_trades(100_000)
     return InvestBacktest(state=state, trades=trades, curve=curve_s, benchmark=bench,

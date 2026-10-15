@@ -84,10 +84,16 @@ def build_panel(bars: dict[str, pd.DataFrame], universe: list[str], s) -> dict[s
     wide = {k: pd.DataFrame({sym: f[k] for sym, f in feats.items()}).reindex(dates)
             for k in ("close", "r12_1", "r6_1", "r3", "h52", "vol126", "dollar_vol",
                       "bars", "atr_pct", "max_jump", "beta")}
-    eligible = (
+    # Base universe: enough history, price and liquidity. Used to rank HELD stocks,
+    # so that a winner is not sold just because a big up-day made it "ineligible".
+    base = (
         (wide["close"] >= s.min_price)
         & (wide["dollar_vol"] >= s.min_dollar_volume)
         & (wide["bars"] >= s.min_history)
+    )
+    # Entry universe: also a tradable volatility, no lottery jump, high beta.
+    eligible = (
+        base
         & (wide["atr_pct"] >= s.atr_min_pct) & (wide["atr_pct"] <= s.atr_max_pct)
         & (wide["max_jump"] <= s.max_daily_jump)
         & ((wide["beta"] >= s.min_beta) | (s.min_beta <= 0))
@@ -102,10 +108,13 @@ def build_panel(bars: dict[str, pd.DataFrame], universe: list[str], s) -> dict[s
     score = sum(WEIGHTS[k] * _zscore(p.where(eligible)) for k, p in parts.items())
     score = score.where(eligible)
     pct = score.rank(axis=1, pct=True)
+    hold_score = sum(WEIGHTS[k] * _zscore(p.where(base)) for k, p in parts.items())
+    hold_pct = hold_score.where(base).rank(axis=1, pct=True)
     for sym, f in feats.items():
         f["eligible"] = eligible[sym].reindex(f.index).fillna(False).astype(bool)
         f["score"] = score[sym].reindex(f.index)
         f["pct_rank"] = pct[sym].reindex(f.index)
+        f["pct_rank_hold"] = hold_pct[sym].reindex(f.index)
     return feats
 
 

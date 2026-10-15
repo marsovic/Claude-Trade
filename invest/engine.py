@@ -25,6 +25,7 @@ import pandas as pd
 
 from invest.brokers.base import Fill, OrderRequest
 from invest.brokers.sim import session_ts
+from invest.config import etp_symbol
 from invest.portfolio import InvestPosition, InvestState, InvestTrade
 from invest.risk import (
     breakeven_stop,
@@ -46,10 +47,6 @@ from invest.signals import (
 )
 
 log = logging.getLogger("invest")
-
-
-def etp_symbol(s) -> str:
-    return f"ETP:{s.etp_underlying}x{s.etp_leverage:g}"
 
 
 class Engine:
@@ -94,10 +91,18 @@ class Engine:
                 pos.entry_price = (pos.entry_price * pos.qty + f.price * f.qty) / total
                 pos.qty = total
                 pos.cost_eur += cost
-                pos.adds += 1
-                pos.stop_loss = max(pos.stop_loss, breakeven_stop(pos, self.s.fees.fx_fee_pct))
-                self._log("add", f"pyramid +{f.qty:g} @ {f.price:.4g}, stop to "
-                          f"{pos.stop_loss:.4g} (break-even)", f.symbol, ts=f.ts)
+                if order is not None and order.reason == "add":
+                    pos.adds += 1
+                    pos.stop_loss = max(pos.stop_loss,
+                                        breakeven_stop(pos, self.s.fees.fx_fee_pct))
+                    self._log("add", f"pyramid +{f.qty:g} @ {f.price:.4g}, stop to "
+                              f"{pos.stop_loss:.4g} (break-even)", f.symbol, ts=f.ts)
+                else:  # another partial fill of the same entry order
+                    pos.initial_qty += f.qty
+                    pos.risk_amount += gross * (order.stop_pct if order and order.stop_pct
+                                                else 0.0)
+                    self._log("open", f"partial fill +{f.qty:g} @ {f.price:.4g}", f.symbol,
+                              ts=f.ts)
             st.cash -= cost
             self._fees(f)
             if self.ledger:
@@ -179,12 +184,8 @@ class Engine:
         close_ts = session_ts(day, dtime(16, 0))
 
         if s.etp_enabled and s.broker == "sim":
-            under = data.bars.get(s.etp_underlying)
-            etp = data.bars.get(etp_symbol(s))
-            if under is not None and not under.empty and (
-                    etp is None or etp.index[-1] < under.index[-1]):
-                data.bars[etp_symbol(s)] = synthetic_etp(under, s.etp_leverage,
-                                                         s.etp_annual_cost)
+            self._synthetic_etp(data)
+        self._apply_splits(day, data)
 
         # 1) settle the previous decisions
         self.exec.settle(self, day, data)
@@ -198,6 +199,9 @@ class Engine:
             if sym in highs:
                 pos.highest = max(pos.highest, highs[sym])
         self.mark(prices)
+        etp = data.bars.get(etp_symbol(s))
+        if s.etp_enabled and s.broker == "sim" and etp is not None and day in etp.index:
+            st.etp_anchor = [str(day.date()), float(etp.loc[day, "close"])]
         equity = self.equity(self.exec.broker_equity())
         st.record_equity(close_ts, equity)
         st.last_day = str(day.date())
@@ -208,7 +212,10 @@ class Engine:
             return {"dead": True, "equity": equity}
         week = f"{day.isocalendar().year}-{day.isocalendar().week}"
         if week != st.week_id:
-            st.week_id, st.week_start_equity = week, equity
+            # Reference = last close of the previous week, so Monday gaps count.
+            st.week_id = week
+            st.week_start_equity = st.prev_close_equity or equity
+        st.prev_close_equity = equity
         if equity < st.week_start_equity * (1 - s.weekly_loss_pause) and not self._paused(day):
             until = (day + pd.offsets.BDay(s.pause_days)).date()
             st.pause_until = str(until)
@@ -275,15 +282,17 @@ class Engine:
             self.exec.on_stop_change(self, pos)
             self._log("stop_moved", f"stop {old:.4g} -> {new_stop:.4g}", pos.symbol)
         close = float(row["close"])
-        pct = None if ev is None else ev.pct_rank
+        pct = None if ev is None else ev.pct_rank  # entry rank (pyramiding)
+        hold = row.get("pct_rank_hold", np.nan)
+        hold = None if hold is None or np.isnan(hold) else float(hold)
         held = int(((feats.index > pd.Timestamp(pos.entry_day)) & (feats.index <= day)).sum())
         if day.weekday() == s.rebalance_weekday:
-            if pct is None or pct < 1 - s.top_pct_hold:
+            if hold is None or hold < 1 - s.top_pct_hold:
                 return f"rank exit (fell out of the top {s.top_pct_hold:.0%})"
             if row["r6_1"] < 0:
                 return "rank exit (6-month momentum turned negative)"
         if held >= s.time_stop_days and pos.r_multiple(close) < s.time_stop_min_r and (
-                pct is None or pct < 1 - s.top_pct_entry):
+                hold is None or hold < 1 - s.top_pct_entry):
             return f"time stop ({held} sessions, {pos.r_multiple(close):+.2f}R)"
         next_report = earnings.get(pos.symbol)
         if next_report and self._sessions_until(day, next_report) <= s.earnings_blackout_days \
@@ -430,15 +439,16 @@ class Engine:
         row = etp_f.loc[day]
         price, atr = float(row["close"]), float(row["atr"])
         limit = price * (1 + s.max_entry_gap)
+        currency = "USD" if s.broker == "sim" else s.etp_currency
         sized, reason = size_position(limit, atr, equity, self._free_cash(), self._open_risk(),
                                       budget, self.fx_now, s.fees, s, max_weight=s.etp_weight,
-                                      foreign=s.broker == "sim")
+                                      foreign=currency != "EUR")
         if sized is None:
             self._log("skip", f"ETP sizing refused: {reason}", sym)
             return
         order = OrderRequest(symbol=sym, side="BUY", qty=sized.qty, kind="LIMIT",
                              limit_price=limit, reason="entry", sleeve="etp",
-                             currency="USD" if s.broker == "sim" else "EUR",
+                             currency=currency,
                              broker_ticker=ticker, stop_pct=sized.stop_pct, atr=atr,
                              risk_eur=sized.risk_eur, day=str(day.date()))
         if self.exec.queue(self, order):
@@ -455,6 +465,7 @@ class Engine:
 
     def die(self, day, equity: float, ts: int) -> None:
         st = self.state
+        self.exec.cancel_entries(self)  # never add exposure after death
         for pos in list(st.positions.values()):
             self.exec.liquidate(self, pos, day)
         st.status = "dead"
@@ -468,6 +479,48 @@ class Engine:
                   f"{self.s.survival_floor:.2f}). The bot stops forever.", data=info, ts=ts)
 
     # ------------------------------------------------------------- helpers
+    def _synthetic_etp(self, data) -> None:
+        """Build the simulated 3x ETP, anchored so that past prices never move.
+
+        Paper trading reloads a moving data window every day; without the anchor
+        the series would be re-based and stops/P&L of an open ETP would jump.
+        """
+        s, st = self.s, self.state
+        sym = etp_symbol(s)
+        under = data.bars.get(s.etp_underlying)
+        etp = data.bars.get(sym)
+        if under is None or under.empty or (etp is not None and not etp.empty
+                                            and etp.index[-1] >= under.index[-1]):
+            return
+        etp = synthetic_etp(under, s.etp_leverage, s.etp_annual_cost)
+        if st.etp_anchor:
+            anchor_day, anchor_price = pd.Timestamp(st.etp_anchor[0]), st.etp_anchor[1]
+            if anchor_day in etp.index and etp.loc[anchor_day, "close"] > 0:
+                scale = anchor_price / float(etp.loc[anchor_day, "close"])
+                etp[["open", "high", "low", "close"]] *= scale
+        data.bars[sym] = etp
+
+    def _apply_splits(self, day, data) -> None:
+        """Rescale open positions and planned orders on a split's ex-date."""
+        st = self.state
+        for sym, (ex_date, ratio) in getattr(data, "splits", {}).items():
+            key = f"{sym}:{ex_date}"
+            if key in st.applied_splits or pd.Timestamp(ex_date) > day:
+                continue
+            st.applied_splits.append(key)
+            pos = st.positions.get(sym)
+            if pos is not None and pd.Timestamp(pos.entry_day) < pd.Timestamp(ex_date):
+                pos.apply_split(ratio)
+                self.exec.on_stop_change(self, pos)
+                self._log("split", f"{ratio:g}-for-1 split on {ex_date}: position now "
+                          f"{pos.qty:g} shares, stop {pos.stop_loss:.4g}", sym)
+            for o in st.pending:
+                if o["symbol"] == sym:
+                    o["qty"] *= ratio
+                    for k in ("limit_price", "stop_price"):
+                        if o.get(k):
+                            o[k] /= ratio
+
     def _paused(self, day) -> bool:
         return bool(self.state.pause_until) and str(day.date()) < self.state.pause_until
 
