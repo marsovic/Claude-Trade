@@ -94,7 +94,7 @@
 <body>
 <div class="wrap">
   <header>
-    <h1>Survival Trading Bot <small>Binance USDⓈ-M futures</small></h1>
+    <h1>Survival Trading Bot <small id="venue">Binance USDⓈ-M futures</small></h1>
     <div class="badges">
       <span id="mode" class="badge">—</span>
       <span id="status" class="badge">connecting…</span>
@@ -145,7 +145,7 @@
       <h2>Market sentiment</h2>
       <div id="fng" class="gauge">—</div>
       <div id="fng-label" class="muted"></div>
-      <div style="margin-top:12px" class="muted">Trending on CoinGecko</div>
+      <div style="margin-top:12px" class="muted" id="trending-label">Trending on CoinGecko</div>
       <div id="trending" class="chips" style="margin-top:6px"></div>
       <div style="margin-top:12px" class="muted">Sources</div>
       <div id="sources" class="chips" style="margin-top:6px"></div>
@@ -156,7 +156,7 @@
   <div class="card section">
     <h2>Open positions</h2>
     <div class="table-wrap"><table>
-      <thead><tr><th>Pair</th><th>Side</th><th class="num">Lev.</th><th class="num">Qty</th>
+      <thead><tr><th>Symbol</th><th>Side</th><th class="num">Lev.</th><th class="num">Qty</th>
         <th class="num">Entry</th><th class="num">Mark</th><th class="num">Stop</th>
         <th class="num">Target</th><th class="num">Risk</th><th class="num">Unrealized</th>
         <th>Opened</th></tr></thead>
@@ -168,14 +168,12 @@
     <div class="card">
       <h2>Scanner — last closed candle <span id="scan-meta" class="muted"
           style="text-transform:none;letter-spacing:0"></span></h2>
-      <div class="muted" style="font-size:12px;margin-bottom:8px">
+      <div class="muted" id="scan-legend" style="font-size:12px;margin-bottom:8px">
         Dots = EMA cross · EMA trend · RSI · MACD · Bollinger · Volume · ATR.
         A trade needs 7/7 on one side.
       </div>
       <div class="table-wrap" style="max-height:520px;overflow-y:auto"><table>
-        <thead><tr><th>Pair</th><th class="num">Price</th><th>Long</th><th>Short</th>
-          <th class="num">RSI</th><th class="num">Vol×</th><th class="num">ATR%</th>
-          <th>Signal</th></tr></thead>
+        <thead id="scanner-head"></thead>
         <tbody id="scanner"></tbody>
       </table></div>
     </div>
@@ -189,7 +187,7 @@
   <div class="card section">
     <h2>Closed trades</h2>
     <div class="table-wrap" style="max-height:420px;overflow-y:auto"><table>
-      <thead><tr><th>Closed</th><th>Pair</th><th>Side</th><th class="num">Lev.</th>
+      <thead><tr><th>Closed</th><th>Symbol</th><th>Side</th><th class="num">Lev.</th>
         <th class="num">Entry</th><th class="num">Exit</th><th class="num">PnL</th>
         <th class="num">R</th><th>Reason</th></tr></thead>
       <tbody id="trades"></tbody>
@@ -204,7 +202,10 @@
 
 <script>
 "use strict";
-const CONDS = ["ema_cross", "ema_trend", "rsi", "macd", "bollinger", "volume", "atr"];
+const DEFAULT_CONDS = ["ema_cross", "ema_trend", "rsi", "macd", "bollinger", "volume", "atr"];
+const DEFAULT_LABELS = ["EMA cross", "EMA trend", "RSI", "MACD", "Bollinger", "Volume", "ATR"];
+let CONDS = DEFAULT_CONDS;
+let CUR = "$";
 const FILTERS = {all: null, trades: ["open", "close"], signals: ["signal", "veto", "skip"],
                  alerts: ["error", "halt", "death", "warning"]};
 let filter = "all";
@@ -272,7 +273,10 @@ function render(data) {
     $("feed").replaceChildren(el("div", "empty", "Start the bot: python -m bot.trading_bot"));
     return;
   }
-  const modeColor = {paper: "blue", testnet: "amber", live: "red"}[s.mode] || "";
+  const cfg = s.settings || {};
+  CUR = cfg.currency_symbol || "$";
+  if (cfg.venue_label) $("venue").textContent = cfg.venue_label;
+  const modeColor = {paper: "blue", testnet: "amber", demo: "amber", live: "red"}[s.mode] || "";
   setBadge($("mode"), (s.mode || "?").toUpperCase(), modeColor);
   const pollMs = ((s.settings && s.settings.poll_seconds) || 20) * 1000;
   const stale = data.now - (s.heartbeat || 0) > Math.max(3 * pollMs, 90000);
@@ -293,7 +297,7 @@ function render(data) {
 
   // KPIs
   const init = s.initial_capital, eq = s.equity, floor = (s.settings || {}).survival_floor || 0;
-  $("k-equity").textContent = fmt(eq) + " $";
+  $("k-equity").textContent = fmt(eq) + " " + CUR;
   $("k-equity").className = "value " + cls(eq - init);
   $("k-equity-sub").textContent = `${signed((eq / init - 1) * 100, 1)}% vs ${fmt(init)} start · floor ${fmt(floor)}`;
   const life = Math.max(0, Math.min(1, (eq - floor) / (init - floor)));
@@ -301,20 +305,20 @@ function render(data) {
   $("life").style.background = life > .6 ? "var(--green)" : life > .3 ? "var(--amber)" : "var(--red)";
   const st = s.stats || {};
   const realized = (st.gross_profit || 0) - (st.gross_loss || 0);
-  $("k-pnl").textContent = signed(realized) + " $";
+  $("k-pnl").textContent = signed(realized) + " " + CUR;
   $("k-pnl").className = "value " + cls(realized);
-  $("k-fees").textContent = `fees ${fmt(st.fees || 0)} $ · ${st.trades || 0} trades`;
+  $("k-fees").textContent = `fees ${fmt(st.fees || 0)} ${CUR} · ${st.trades || 0} trades`;
   $("k-win").textContent = st.trades ? fmt(st.wins / st.trades * 100, 0) + "%" : "—";
   const pf = st.gross_loss > 0 ? fmt(st.gross_profit / st.gross_loss) : (st.gross_profit > 0 ? "∞" : "—");
   $("k-wl").textContent = `${st.wins || 0} W / ${st.losses || 0} L · PF ${pf}`;
   const dd = s.peak_equity ? (1 - eq / s.peak_equity) * 100 : 0;
   $("k-dd").textContent = fmt(dd, 1) + "%";
   $("k-dd").className = "value " + (dd > 0.05 ? "neg" : "");
-  $("k-peak").textContent = `peak ${fmt(s.peak_equity)} $`;
+  $("k-peak").textContent = `peak ${fmt(s.peak_equity)} ${CUR}`;
   const positions = Object.values(s.positions || {});
   const margin = positions.reduce((a, p) => a + p.margin, 0);
   $("k-open").textContent = `${positions.length} / ${(s.settings || {}).max_open_positions || "?"}`;
-  $("k-margin").textContent = `margin ${fmt(margin)} $`;
+  $("k-margin").textContent = `${cfg.exposure_label || "margin"} ${fmt(margin)} ${CUR}`;
 
   drawChart(s.equity_history || [], init, floor);
   renderSentiment(s);
@@ -328,25 +332,36 @@ function render(data) {
 
 function renderSentiment(s) {
   const m = s.sentiment || {};
-  const fng = m.fear_greed;
+  const gauge = m.gauge || (m.fear_greed ? {value: m.fear_greed.value, label: "Fear & Greed",
+    classification: m.fear_greed.classification, higher_is_bullish: true} : null);
   if (m.enabled === false) {
     $("fng").textContent = "off";
     $("fng-label").textContent = "sentiment filter disabled";
-  } else if (fng) {
-    $("fng").textContent = fng.value;
-    $("fng").className = "gauge " + (fng.value >= 55 ? "pos" : fng.value <= 45 ? "neg" : "");
-    $("fng-label").textContent = "Fear & Greed — " + fng.classification;
+  } else if (gauge) {
+    $("fng").textContent = typeof gauge.value === "number" ? fmt(gauge.value, gauge.decimals || 0) : gauge.value;
+    const bull = gauge.higher_is_bullish === false ? gauge.value <= (gauge.bull_below ?? 45)
+                                                   : gauge.value >= 55;
+    const bear = gauge.higher_is_bullish === false ? gauge.value >= (gauge.bear_above ?? 55)
+                                                   : gauge.value <= 45;
+    $("fng").className = "gauge " + (bull ? "pos" : bear ? "neg" : "");
+    $("fng-label").textContent = gauge.label + (gauge.classification ? " — " + gauge.classification : "");
   } else {
     $("fng").textContent = "—";
-    $("fng-label").textContent = "Fear & Greed unavailable";
+    $("fng-label").textContent = "market gauge unavailable";
   }
+  $("trending-label").textContent = m.trending_label || "Trending on CoinGecko";
   const universe = new Set(s.universe || []);
   $("trending").replaceChildren(...(m.trending || []).map((sym) => {
     const c = el("span", "chip", sym);
-    if (universe.has(sym + "USDT")) c.style.outline = "1px solid var(--accent)";
+    if (universe.has(sym) || universe.has(sym + "USDT")) c.style.outline = "1px solid var(--accent)";
     return c;
   }));
   if (!(m.trending || []).length) $("trending").replaceChildren(el("span", "muted", "—"));
+  if (Array.isArray(m.source_list)) {
+    $("sources").replaceChildren(...m.source_list.map((x) =>
+      el("span", "chip", x.name + (x.ok ? " ✓" : " — " + (x.note || "off")))));
+    return;
+  }
   const src = m.sources || {};
   $("sources").replaceChildren(
     el("span", "chip", "Fear & Greed ✓"), el("span", "chip", "CoinGecko ✓"),
@@ -370,30 +385,46 @@ function renderPositions(positions, marks) {
       {text: "x" + p.leverage, cls: "num"}, {text: px(p.qty), cls: "num"},
       {text: px(p.entry_price), cls: "num"}, {text: px(mark), cls: "num"},
       {text: px(p.stop_loss), cls: "num"}, {text: px(p.take_profit), cls: "num"},
-      {text: fmt(p.risk_amount) + " $", cls: "num"},
-      {text: upnl === null ? "—" : signed(upnl) + " $", cls: "num " + cls(upnl)},
+      {text: fmt(p.risk_amount) + " " + CUR, cls: "num"},
+      {text: upnl === null ? "—" : signed(upnl) + " " + CUR, cls: "num " + cls(upnl)},
       {text: datetime(p.opened_at)},
     ]);
   }));
 }
 
 function renderScanner(scan) {
+  CONDS = scan.conditions || DEFAULT_CONDS;
+  const longOnly = !!scan.long_only;
+  const labels = scan.condition_labels || (scan.conditions ? CONDS : DEFAULT_LABELS);
+  $("scan-legend").textContent = `Dots = ${labels.join(" · ")}. A trade needs ` +
+    `${CONDS.length}/${CONDS.length}` + (longOnly ? " (long only)." : " on one side.");
   $("scan-meta").textContent = scan.time
-    ? `· ${time(scan.time)} · ${scan.evaluated} pairs · ${scan.interval}` : "";
+    ? `· ${time(scan.time)} · ${scan.evaluated} symbols · ${scan.interval}` : "";
   const evs = scan.evaluations || [];
+  const hasScore = evs.some((e) => e.score !== undefined && e.score !== null);
+  const head = ["Symbol", "Price", longOnly ? "Conditions" : "Long"];
+  if (!longOnly) head.push("Short");
+  if (hasScore) head.push("Score");
+  head.push("RSI", "Vol×", "ATR%", "Signal");
+  const numeric = new Set(["Price", "Score", "RSI", "Vol×", "ATR%"]);
+  const tr = el("tr");
+  for (const h of head) tr.appendChild(el("th", numeric.has(h) ? "num" : "", h));
+  $("scanner-head").replaceChildren(tr);
   if (!evs.length) {
     $("scanner").replaceChildren(row([{text: "No scan yet.", cls: "muted"}]));
     return;
   }
+  const n = CONDS.length;
   $("scanner").replaceChildren(...evs.map((e) => {
-    const sig = e.signal ? el("span", "badge " + (e.signal === "LONG" ? "b-green" : "b-red"), e.signal)
-                         : el("span", "muted", `${Math.max(e.long_score, e.short_score)}/7`);
-    return row([
-      {text: e.symbol}, {text: px(e.price), cls: "num"},
-      {node: dots(e.long, "long")}, {node: dots(e.short, "short")},
-      {text: fmt(e.values.rsi, 1), cls: "num"}, {text: fmt(e.values.vol_ratio, 2), cls: "num"},
-      {text: fmt(e.atr_pct, 2), cls: "num"}, {node: sig},
-    ]);
+    const best = longOnly ? e.long_score : Math.max(e.long_score, e.short_score);
+    const sig = e.signal ? el("span", "badge " + (e.signal === "SHORT" ? "b-red" : "b-green"), e.signal)
+                         : el("span", "muted", `${best}/${n}`);
+    const cells = [{text: e.symbol}, {text: px(e.price), cls: "num"}, {node: dots(e.long, "long")}];
+    if (!longOnly) cells.push({node: dots(e.short, "short")});
+    if (hasScore) cells.push({text: e.score === null || e.score === undefined ? "—" : fmt(e.score, 2), cls: "num"});
+    cells.push({text: fmt(e.values.rsi, 1), cls: "num"}, {text: fmt(e.values.vol_ratio, 2), cls: "num"},
+               {text: fmt(e.atr_pct, 2), cls: "num"}, {node: sig});
+    return row(cells);
   }));
 }
 
@@ -426,7 +457,7 @@ function renderTrades(trades) {
     {text: t.side, cls: t.side === "LONG" ? "pos" : "neg"},
     {text: "x" + t.leverage, cls: "num"}, {text: px(t.entry_price), cls: "num"},
     {text: px(t.exit_price), cls: "num"},
-    {text: signed(t.pnl) + " $", cls: "num " + cls(t.pnl)},
+    {text: signed(t.pnl) + " " + CUR, cls: "num " + cls(t.pnl)},
     {text: signed(t.r_multiple), cls: "num " + cls(t.r_multiple)},
     {text: t.reason.replace("_", " ")},
   ])));
