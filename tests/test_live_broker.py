@@ -18,6 +18,7 @@ class FakeExchange:
         self.orders = []
         self.income_rows = []
         self.fail_stop = False
+        self.reject_stops = 0
         self.wallet = 1000.0
         self.dual = False
         self.withdrawals = False
@@ -54,6 +55,13 @@ class FakeExchange:
                                 client_algo_id=None):
         if order_type == "STOP_MARKET" and self.fail_stop:
             raise BinanceAPIError(400, -2021, "Order would immediately trigger.")
+        if order_type == "STOP_MARKET" and self.reject_stops > 0:
+            self.reject_stops -= 1
+            raise BinanceAPIError(400, -1111, "Precision is over the maximum.")
+        if any(v[:3] == (symbol, side, order_type) for v in self.algo.values()):
+            # Like Binance: one closePosition order per type and direction.
+            raise BinanceAPIError(400, -4130, "An open stop or take profit order with GTE "
+                                              "and closePosition in the direction is existing.")
         algo_id = self.next_id
         self.next_id += 1
         self.algo[algo_id] = (symbol, side, order_type, float(trigger_price))
@@ -176,3 +184,27 @@ def test_equity_is_capped_by_the_real_wallet(tmp_path):
     assert broker.equity({}) == pytest.approx(30.0)
     ex.wallet = 5000.0
     assert broker.equity({}) == pytest.approx(50.0)  # only the bot's own capital
+
+
+def test_failed_stop_move_restores_the_old_stop(tmp_path):
+    _, state, ex, broker = make(tmp_path)
+    pos = broker.open(PLAN, 100.0, now=1)
+    state.positions["AAAUSDT"] = pos
+    pos.best_price = 101.5
+    ex.reject_stops = 1  # the new stop is rejected, the old one is put back
+    closed = broker.sync({"AAAUSDT": 101.5}, now=2)
+    assert closed == []
+    assert pos.stop_loss == 99.0 and not pos.breakeven_done
+    stops = [v for v in ex.algo.values() if v[2] == "STOP_MARKET"]
+    assert stops == [("AAAUSDT", "SELL", "STOP_MARKET", 99.0)]
+
+
+def test_position_closed_when_no_stop_can_be_placed(tmp_path):
+    _, state, ex, broker = make(tmp_path)
+    pos = broker.open(PLAN, 100.0, now=1)
+    state.positions["AAAUSDT"] = pos
+    pos.best_price = 101.5
+    ex.reject_stops = 2  # new stop and old stop both rejected
+    closed = broker.sync({"AAAUSDT": 101.5}, now=2)
+    assert len(closed) == 1 and closed[0].reason == "stop_loss"
+    assert ex.positions == {}

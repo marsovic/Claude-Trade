@@ -259,27 +259,43 @@ class BinanceBroker:
                 info = self.symbols[symbol]
                 if info.round_price(pos.stop_loss) == info.round_price(old_stop):
                     continue
-                try:
-                    new_id = self._place_stop(pos, pos.stop_loss)
-                except BinanceAPIError as exc:
-                    if exc.code == -2021:  # would trigger immediately: price is past it
-                        closed.append(self.close(pos, mark, "trailing_stop", now))
-                        continue
-                    log.warning("%s: could not move stop (%s), keeping the old one",
-                                symbol, exc)
-                    pos.stop_loss, pos.breakeven_done = old_stop, old_breakeven
-                    continue
-                if pos.sl_algo_id:
-                    try:
-                        self.client.cancel_algo_order(pos.sl_algo_id)
-                    except BinanceAPIError as exc:
-                        log.warning("%s: old stop not cancelled: %s", symbol, exc)
-                pos.sl_algo_id = new_id
-                self.store.log_decision(
-                    "stop_moved", f"stop {old_stop:.6g} -> {pos.stop_loss:.6g}",
-                    symbol, pos.side, {"mark": mark}, ts=now)
+                trade = self._move_stop(pos, old_stop, old_breakeven, mark, now)
+                if trade:
+                    closed.append(trade)
         self._sync_income()
         return closed
+
+    def _move_stop(self, pos: Position, old_stop: float, old_breakeven: bool, mark: float,
+                   now: int) -> ClosedTrade | None:
+        """Replace the exchange stop. Never leaves the position unprotected.
+
+        Binance accepts only one closePosition STOP_MARKET per direction
+        (error -4130), so the old stop is cancelled before the new one is placed.
+        """
+        symbol = pos.symbol
+        if pos.sl_algo_id:
+            try:
+                self.client.cancel_algo_order(pos.sl_algo_id)
+            except BinanceAPIError as exc:
+                log.warning("%s: could not cancel the stop (%s), keeping it", symbol, exc)
+                pos.stop_loss, pos.breakeven_done = old_stop, old_breakeven
+                return None
+        try:
+            pos.sl_algo_id = self._place_stop(pos, pos.stop_loss)
+        except BinanceAPIError as exc:
+            if exc.code == -2021:  # would trigger immediately: price is already past it
+                return self.close(pos, mark, "trailing_stop", now)
+            log.warning("%s: could not move stop (%s), restoring the old one", symbol, exc)
+            pos.stop_loss, pos.breakeven_done = old_stop, old_breakeven
+            try:
+                pos.sl_algo_id = self._place_stop(pos, old_stop)
+            except BinanceAPIError as exc2:
+                log.error("%s: old stop rejected too (%s): closing at market", symbol, exc2)
+                return self.close(pos, mark, "stop_loss", now)
+            return None
+        self.store.log_decision("stop_moved", f"stop {old_stop:.6g} -> {pos.stop_loss:.6g}",
+                                symbol, pos.side, {"mark": mark}, ts=now)
+        return None
 
     def _sync_income(self) -> None:
         """Accumulate realized PnL, fees and funding since the bot started."""
