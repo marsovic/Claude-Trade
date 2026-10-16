@@ -124,10 +124,11 @@ class Research:
                     rel = float(ts.get("relevance_score", 0) or 0)
                     weighted += rel * float(ts.get("ticker_sentiment_score", 0) or 0)
                     total += rel
-        if total < 0.5:
+        if total < 1.0:  # about two relevant articles at least
             return None
-        # AV scores live roughly in [-0.35, 0.35]: rescale to [-1, 1].
-        return max(-1.0, min(1.0, weighted / total / 0.35))
+        # AV labels >= 0.35 "bullish" and <= -0.35 "bearish"; dividing by 0.6 keeps a
+        # merely bullish article below 1 instead of saturating every score.
+        return max(-1.0, min(1.0, weighted / total / 0.6))
 
     def _finnhub_news(self, symbol: str, today: date) -> float | None:
         rows = self._get(f"{FINNHUB_URL}/company-news",
@@ -226,7 +227,7 @@ class Research:
                 return 0
             recent = self._sec(SEC_SUBMISSIONS.format(cik=cik)).json()["filings"]["recent"]
             since = today - timedelta(days=days)
-            count = 0
+            buyers: set[str] = set()
             for form, filed, acc, doc in zip(recent["form"], recent["filingDate"],
                                              recent["accessionNumber"],
                                              recent["primaryDocument"], strict=False):
@@ -235,10 +236,10 @@ class Research:
                 raw_doc = doc.split("/")[-1]  # strip the xslF345X0x/ rendering prefix
                 xml = self._sec(SEC_ARCHIVE.format(cik=cik, acc=acc.replace("-", ""),
                                                    doc=raw_doc)).text
-                count += count_open_market_buys(xml)
-                if count >= 3:
+                buyers |= open_market_buyers(xml, cik, fallback=acc)
+                if len(buyers) >= 3:
                     break
-            return count
+            return len(buyers)
         return self._cached(f"insider:{symbol}:{today}", 24 * 3600, load)
 
     # ---------------------------------------------------------------- summary
@@ -266,6 +267,26 @@ class Research:
             ],
             "regime": regime,
         }
+
+
+def open_market_buyers(xml_text: str, issuer_cik: int, fallback: str = "") -> set[str]:
+    """Insiders who bought ``issuer_cik`` shares on the open market in one Form 4.
+
+    A company's submissions also list Form 4s it filed as an insider of *another*
+    issuer: those are ignored. One insider buying in several lines counts once.
+    """
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError:
+        return set()
+    issuer = root.findtext("issuer/issuerCik", default="").strip()
+    if not issuer.isdigit() or int(issuer) != int(issuer_cik):
+        return set()
+    if not count_open_market_buys(xml_text):
+        return set()
+    owners = {o.strip().lstrip("0") for o in
+              (e.text or "" for e in root.iter("rptOwnerCik")) if o.strip()}
+    return owners or {fallback or "unknown"}
 
 
 def count_open_market_buys(xml_text: str) -> int:

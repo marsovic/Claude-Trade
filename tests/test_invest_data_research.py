@@ -1,5 +1,5 @@
 import json
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 
 import pandas as pd
 import pytest
@@ -9,13 +9,19 @@ from invest.data import (
     AlpacaDataProvider,
     BarProvider,
     BarStore,
+    DataError,
     MarketData,
     MassiveProvider,
     TiingoProvider,
     ecb_eurusd,
     fred_series,
 )
-from invest.sentiment import Research, count_open_market_buys, headline_score
+from invest.sentiment import (
+    Research,
+    count_open_market_buys,
+    headline_score,
+    open_market_buyers,
+)
 from invest.tax import TaxLedger
 from invest.universe import build_universe
 from tests.invest_helpers import settings
@@ -75,16 +81,25 @@ def test_massive_rate_limit_retry():
     assert p.history("AMD", date(2026, 1, 1), date(2026, 1, 2)).empty
 
 
-def test_alpaca_data_pagination_and_iex_fallback():
-    pages = [Resp(status=403, text="sip not allowed"),
-             Resp({"bars": {"AMD": [{"t": "2026-10-13T04:00:00Z", "o": 1, "h": 2, "l": 1,
+def test_alpaca_data_pagination_and_sip_window():
+    pages = [Resp({"bars": {"AMD": [{"t": "2026-10-13T04:00:00Z", "o": 1, "h": 2, "l": 1,
                                      "c": 1.5, "v": 10}]}, "next_page_token": "x"}),
              Resp({"bars": {"AMD": [{"t": "2026-10-14T04:00:00Z", "o": 1, "h": 2, "l": 1,
                                      "c": 1.6, "v": 10}]}, "next_page_token": None})]
     p = AlpacaDataProvider("k", "s", session=Session(lambda u, q: pages.pop(0)),
                            sleep=lambda _: None)
     df = p.history("AMD", date(2026, 10, 1), date(2026, 10, 14))
-    assert list(df["close"]) == [1.5, 1.6] and p.feed == "iex"
+    assert list(df["close"]) == [1.5, 1.6] and p.feed == "sip"
+    end = datetime.fromisoformat(p.session.calls[0][1]["end"].replace("Z", "+00:00"))
+    assert end <= datetime.now(timezone.utc) - timedelta(minutes=15)  # free-plan SIP delay
+
+
+def test_alpaca_refused_sip_is_an_error_not_a_silent_iex_switch():
+    p = AlpacaDataProvider("k", "s", session=Session(lambda u, q: Resp(status=403,
+                                                                       text="no sip")),
+                           sleep=lambda _: None)
+    with pytest.raises(DataError, match="SIP"):
+        p.history("AMD", date(2026, 10, 1), date(2026, 10, 14))
 
 
 def test_tiingo_adjusted_prices():
@@ -175,9 +190,19 @@ FORM4 = """<ownershipDocument><nonDerivativeTable>
 </nonDerivativeTable></ownershipDocument>"""
 
 
+def form4(issuer: int, owner: str, body: str = FORM4) -> str:
+    head = (f"<ownershipDocument><issuer><issuerCik>{issuer:010d}</issuerCik></issuer>"
+            f"<reportingOwner><reportingOwnerId><rptOwnerCik>{owner}</rptOwnerCik>"
+            "</reportingOwnerId></reportingOwner>")
+    return body.replace("<ownershipDocument>", head, 1)
+
+
 def test_form4_parsing():
     assert count_open_market_buys(FORM4) == 1
     assert count_open_market_buys("not xml") == 0
+    assert open_market_buyers(form4(2488, "0001111"), 2488) == {"1111"}
+    assert open_market_buyers(form4(9999, "0001111"), 2488) == set()  # another issuer
+    assert open_market_buyers(FORM4, 2488) == set()  # no issuer: not trusted
 
 
 def research(handler, **kw):
@@ -197,11 +222,13 @@ def test_news_av_then_finnhub_fallback():
 
 
 def test_av_news_scores():
-    feed = {"feed": [{"ticker_sentiment": [
+    item = {"ticker_sentiment": [
         {"ticker": "AMD", "relevance_score": "0.9", "ticker_sentiment_score": "0.35"},
-        {"ticker": "NVDA", "relevance_score": "0.9", "ticker_sentiment_score": "-0.9"}]}]}
-    r = research(lambda u, q: Resp(feed), alphavantage_api_key="a")
-    assert r.news_score("AMD", date(2026, 10, 14))[0] == pytest.approx(1.0)
+        {"ticker": "NVDA", "relevance_score": "0.9", "ticker_sentiment_score": "-0.9"}]}
+    r = research(lambda u, q: Resp({"feed": [item, item]}), alphavantage_api_key="a")
+    assert r.news_score("AMD", date(2026, 10, 14))[0] == pytest.approx(0.35 / 0.6)
+    one = research(lambda u, q: Resp({"feed": [item]}), alphavantage_api_key="a")
+    assert one._av_news("AMD", date(2026, 10, 14)) is None  # one article is not a tone
 
 
 def test_mania_and_earnings():
@@ -235,10 +262,15 @@ def test_insider_buys_via_sec(monkeypatch):
                                                           "2026-10-02"],
                 "accessionNumber": ["0001-26-1", "0001-26-2", "0001-26-3"],
                 "primaryDocument": ["xslF345X05/doc1.xml", "doc2.xml", "q.htm"]}}})
-        return Resp(text=FORM4)
+        # Two filings by two insiders, the second one with two purchase lines.
+        if url.endswith("doc1.xml"):
+            return Resp(text=form4(2488, "0000001"))
+        return Resp(text=form4(2488, "0000002", FORM4.replace(
+            "<nonDerivativeTable>", "<nonDerivativeTable>" + FORM4.split(
+                "<nonDerivativeTable>")[1].split("</nonDerivativeTable>")[0], 1)))
 
     r = research(handler, sec_user_agent="Test test@example.com")
-    assert r.insider_buys("AMD", date(2026, 10, 14)) == 2
+    assert r.insider_buys("AMD", date(2026, 10, 14)) == 2  # distinct insiders
     urls = [c[0] for c in r.session.calls]
     assert any(u.endswith("/2488/0001261/doc1.xml") for u in urls)  # xsl prefix removed
     assert all(c[2] == {"User-Agent": "Test test@example.com"} for c in r.session.calls)

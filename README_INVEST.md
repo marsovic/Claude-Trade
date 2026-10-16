@@ -139,7 +139,7 @@ cp .env.example .env                     # fill the INVEST section (MASSIVE_API_
 
 # Simulator on real market data, Trading 212 costs (no broker account needed)
 python -m invest.invest_bot              # runs forever (decides after each US close)
-python -m invest.invest_bot --once       # process the last close and exit (cron-friendly)
+python -m invest.invest_bot --once       # simulator only: process the last close and exit
 
 # Dashboard (same as the crypto bot), in another terminal
 python dashboard/dashboard.py --state-dir state_invest --port 8051
@@ -157,6 +157,12 @@ INV_T212_TERMS_ACKNOWLEDGED=true python -m invest.invest_bot --broker trading212
 ```
 
 Keep one state directory per broker and environment: the bot refuses to mix them.
+
+With a real broker the bot must run **continuously** (systemd, Docker, `tmux`):
+orders decided after the close are sent at the next open and stops are watched
+during the session. `--once` is therefore refused with a real broker (it still
+runs one liquidation step after a death). The NYSE calendar (weekends and
+holidays) is built in; early closes (13:00 ET) are not.
 
 ### Real-money safety rules built in
 
@@ -176,7 +182,9 @@ Keep one state directory per broker and environment: the bot refuses to mix them
   - at death it cancels working buys and liquidates;
   - it keeps reconciling the liquidation until the account is flat, even after a
     restart, and then refuses to run.
-- Stock splits are detected in the data cache, and open positions are rescaled.
+- Stock splits are detected in the data cache (and remembered across restarts in
+  `bars/splits.json`), and open positions are rescaled.
+- A refused or expired liquidation order is sent again until the account is flat.
 
 **Leveraged ETP with a real broker.** EU retail cannot buy US-domiciled ETFs, so
 pick an EU-listed 2x/3x product your broker offers, and pass its appropriateness
@@ -218,7 +226,10 @@ This is not tax advice: check impots.gouv.fr or an adviser.
   - Prices are split-adjusted, without dividends.
   - EUR/USD is constant unless an ECB series is loaded.
   - News, Reddit, earnings and insider history are not replayed.
+  - The VIX is used with a one-session lag, as live (FRED publishes it the next morning).
 - **Leveraged ETPs.** Volatility drag of roughly 3σ² per year at 3x. Real ETP prices and tickers depend on the broker.
+- **Data.** Alpaca market data needs the SIP feed (15-minute delay on the free plan):
+  the bot refuses the IEX-only feed, whose volumes would distort the signals.
 - **Fees.** 100 € is tiny. On IBKR, a 1 $ minimum commission is ~3 % of a 33 € position, so most trades are refused by the fee guard.
 - **Trading 212.** The API is still beta and its policy on bots is not explicit.
 - **No network here.** The code was tested against fakes and synthetic markets only. Run it in simulation/demo first and read the decision journal.

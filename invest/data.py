@@ -16,16 +16,21 @@ missing days are downloaded afterwards.
 
 from __future__ import annotations
 
+import contextlib
 import io
+import json
 import logging
 import time
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
+from datetime import time as dtime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pandas as pd
 import requests
+
+from invest.markets import next_trading_day, split_ratio
 
 log = logging.getLogger(__name__)
 ET = ZoneInfo("America/New_York")
@@ -156,16 +161,22 @@ class AlpacaDataProvider(BarProvider):
             token = None
             while True:
                 self.limiter.wait()
+                # The free plan serves SIP data older than 15 minutes only.
+                latest = datetime.now(timezone.utc) - timedelta(minutes=16)
+                stop = min(datetime.combine(end, dtime(23, 59, 59), tzinfo=timezone.utc),
+                           latest)
                 params = {"symbols": ",".join(chunk), "timeframe": "1Day",
-                          "start": f"{start}T00:00:00Z", "end": f"{end}T23:59:59Z",
+                          "start": f"{start}T00:00:00Z",
+                          "end": stop.strftime("%Y-%m-%dT%H:%M:%SZ"),
                           "adjustment": "split", "feed": self.feed, "limit": 10000}
                 if token:
                     params["page_token"] = token
                 resp = self.session.get(self.BASE, params=params, timeout=30)
                 if resp.status_code == 403 and self.feed == "sip":
-                    log.warning("Alpaca SIP feed refused on this plan, using IEX")
-                    self.feed = "iex"
-                    continue
+                    # IEX alone is ~2 % of US volume: its bars would distort the
+                    # volume and breakout rules, so never switch silently.
+                    raise DataError("Alpaca refused the SIP feed (403). Use another "
+                                    "INV_DATA_PROVIDER (massive, tiingo) or a plan with SIP.")
                 if resp.status_code >= 400:
                     raise DataError(f"Alpaca data HTTP {resp.status_code}: {resp.text[:200]}")
                 body = resp.json()
@@ -307,25 +318,32 @@ class BarStore:
                  and f.index[-1].date() < end]
         if stale:
             last = {sym: frames[sym].index[-1] for sym in stale}
-            oldest = min(d.date() for d in last.values())
-            days = [oldest + timedelta(days=i) for i in range(1, (end - oldest).days + 1)]
-            days = [d for d in days if d.weekday() < 5]
             mismatch: dict[str, float] = {}
-            if self.provider.supports_grouped and len(days) <= 15:
-                for check in sorted({d.date() for d in last.values()}):
+            # Grouped daily files (one call per day) only for symbols that are a
+            # few days behind: one long-stale symbol must not slow everything down.
+            recent = [sym for sym in stale if (end - last[sym].date()).days <= 21]
+            if not self.provider.supports_grouped:
+                recent = []
+            if recent:
+                oldest = min(last[sym].date() for sym in recent)
+                days = [oldest + timedelta(days=i) for i in range(1, (end - oldest).days + 1)]
+                days = [d for d in days if d.weekday() < 5]
+                for check in sorted({last[sym].date() for sym in recent}):
                     rows = self.provider.grouped(check) or {}
-                    for sym in stale:
+                    for sym in recent:
                         if last[sym].date() == check and sym in rows:
                             self._compare(sym, frames[sym], rows[sym]["close"], mismatch)
                 for day in days:
                     rows = self.provider.grouped(day) or {}
-                    for sym in stale:
+                    for sym in recent:
                         if sym in rows and sym not in mismatch \
                                 and frames[sym].index[-1].date() < day:
                             new = pd.DataFrame([rows[sym]], index=pd.to_datetime([day]))
                             frames[sym] = normalise(pd.concat([frames[sym], new]))
-            else:
-                for sym, df in self.provider.history_many(stale, oldest, end).items():
+            behind = [sym for sym in stale if sym not in recent]
+            if behind:
+                oldest = min(last[sym].date() for sym in behind)
+                for sym, df in self.provider.history_many(behind, oldest, end).items():
                     if last[sym] in df.index:
                         self._compare(sym, frames[sym], float(df.loc[last[sym], "close"]),
                                       mismatch)
@@ -338,17 +356,42 @@ class BarStore:
                 for sym, df in fresh.items():
                     if df.empty:
                         continue
-                    new_days = df.index[df.index > last[sym]]
-                    ratio = mismatch[sym]
-                    if (ratio >= 1.4 or ratio <= 0.75) and len(new_days):
-                        self.splits[sym] = (str(new_days[0].date()), round(ratio, 4))
+                    ratio = split_ratio(mismatch[sym])
+                    if ratio:
+                        new_days = df.index[df.index > last[sym]]
+                        # No new bar yet (weekend): the split is effective next session.
+                        ex_date = new_days[0].date() if len(new_days) \
+                            else next_trading_day(last[sym].date())
+                        self.splits[sym] = (str(ex_date), ratio)
                     frames[sym] = df
+        self.splits = self._remember_splits(self.splits, end)
         cutoff = pd.Timestamp(start_full)
         for sym in symbols:
             frames[sym] = frames[sym][frames[sym].index >= cutoff]
             if not frames[sym].empty:
                 self.save(sym, frames[sym])
         return frames
+
+    def _remember_splits(self, found: dict[str, tuple[str, float]],
+                         end: date) -> dict[str, tuple[str, float]]:
+        """Splits survive restarts: once the history is reloaded nothing shows them.
+
+        The engine applies each (symbol, ex-date) once; entries older than 60
+        days are forgotten.
+        """
+        path = self.dir / "splits.json"
+        known: dict = {}
+        with contextlib.suppress(OSError, ValueError):
+            known = json.loads(path.read_text())
+        known = {k: tuple(v) for k, v in known.items() if isinstance(v, list) and len(v) == 2}
+        known.update(found)
+        cutoff = end - timedelta(days=60)
+        known = {k: v for k, v in known.items() if date.fromisoformat(v[0]) >= cutoff}
+        if known or path.exists():
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(json.dumps({k: list(v) for k, v in known.items()}, indent=1))
+            tmp.replace(path)
+        return known
 
     @staticmethod
     def _compare(sym: str, cached: pd.DataFrame, provider_close: float,
@@ -442,11 +485,19 @@ class MarketData:
 
 
 def load_market_data(s, symbols: list[str], end: date, store: BarStore | None = None,
-                     session: requests.Session | None = None) -> MarketData:
+                     session: requests.Session | None = None, fx_fallback: float | None = None,
+                     last_day: date | None = None) -> MarketData:
+    """``fx_fallback``: last EUR/USD rate known to the bot (the ECB may be down).
+    ``last_day``: last processed close; the ETP prices (Alpha Vantage, 25 calls a
+    day on the free plan) are fetched only once a newer close exists."""
     store = store or BarStore(s.data_dir, make_provider(s), s.history_days)
     bars = store.update(symbols, end)
     splits = dict(getattr(store, "splits", {}))
-    if s.broker != "sim" and s.etp_enabled and s.etp_price_symbol and s.alphavantage_api_key:
+    bench = bars.get(s.benchmark)
+    new_close = bench is not None and not bench.empty and (
+        last_day is None or bench.index[-1].date() > last_day)
+    if s.broker != "sim" and s.etp_enabled and s.etp_price_symbol and s.alphavantage_api_key \
+            and new_close:
         from invest.config import etp_symbol
 
         try:
@@ -464,4 +515,5 @@ def load_market_data(s, symbols: list[str], end: date, store: BarStore | None = 
         except Exception as exc:  # macro data is optional; the bot degrades gracefully
             log.warning("%s unavailable: %s", name, exc)
             macro[name] = pd.Series(dtype=float)
-    return MarketData(bars=bars, splits=splits, eurusd_fallback=s.eurusd_fallback, **macro)
+    return MarketData(bars=bars, splits=splits,
+                      eurusd_fallback=fx_fallback or s.eurusd_fallback, **macro)

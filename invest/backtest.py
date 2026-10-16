@@ -70,7 +70,12 @@ class InvestBacktest:
         rets = curve.pct_change().dropna()
         sharpe = float(rets.mean() / rets.std() * math.sqrt(252)) if rets.std() > 0 else 0.0
         bench_final = float(self.benchmark.iloc[-1]) if len(self.benchmark) else float("nan")
-        yearly = curve.groupby(curve.index.year).agg(["first", "last"])
+        # Each year runs from the previous year's last close (the start for year one).
+        yearly = {}
+        base = s.initial_capital
+        for year, part in curve.groupby(curve.index.year):
+            yearly[int(year)] = round((float(part.iloc[-1]) / base - 1) * 100, 1)
+            base = float(part.iloc[-1])
         return {
             "initial_eur": s.initial_capital,
             "final_eur": round(final, 2),
@@ -88,9 +93,15 @@ class InvestBacktest:
             "trading_days": self.days,
             "died": s.status == "dead",
             "benchmark_spy_final_eur": round(bench_final, 2),
-            "yearly_return_pct": {int(y): round(float(r["last"] / r["first"] - 1) * 100, 1)
-                                  for y, r in yearly.iterrows()},
+            "yearly_return_pct": yearly,
         }
+
+
+def _lag(series: pd.Series | None) -> pd.Series | None:
+    """Value known at a session's close: the previous observation."""
+    if series is None or series.empty:
+        return series
+    return series.shift(1).dropna()
 
 
 def run_backtest(bars: dict[str, pd.DataFrame], s: InvestSettings, start=None, end=None,
@@ -108,6 +119,9 @@ def run_backtest(bars: dict[str, pd.DataFrame], s: InvestSettings, start=None, e
     state.universe = universe
     execution = SimExecution(s, state, s.fees)
     engine = Engine(s, state, store, execution, research=None, ledger=TaxLedger(out_dir))
+    # FRED publishes a day's VIX close the next morning: live, the decision at the
+    # close uses the previous session's value, so the backtest does the same.
+    vix, vix3m = (_lag(x) for x in (vix, vix3m))
     data = MarketData(bars=dict(bars), vix=vix if vix is not None else pd.Series(dtype=float),
                       vix3m=vix3m if vix3m is not None else pd.Series(dtype=float),
                       eurusd=eurusd if eurusd is not None else pd.Series(dtype=float),
@@ -177,6 +191,7 @@ def main(argv=None) -> int:
         bars = store.update(symbols, date.today())
     else:
         p.error("give --csv-dir or --provider")
+    bars = {k: v for k, v in bars.items() if v is not None and not v.empty}
     if s.benchmark not in bars:
         raise SystemExit(f"{s.benchmark} bars are required (market regime)")
     first = min(df.index[0] for df in bars.values()).date()

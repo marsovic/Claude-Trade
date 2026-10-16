@@ -23,7 +23,7 @@ import logging
 import signal
 import sys
 import time
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from datetime import time as dtime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -40,6 +40,7 @@ from invest.config import LIVE_CONFIRMATION, ConfigError, InvestSettings
 from invest.data import ET, load_market_data
 from invest.engine import Engine
 from invest.execution import LiveExecution, SimExecution
+from invest.markets import is_trading_day, next_trading_day
 from invest.portfolio import InvestState
 from invest.sentiment import Research
 from invest.tax import TaxLedger
@@ -84,13 +85,14 @@ class InvestBot:
         self.ledger = TaxLedger(s.state_dir)
         self._broker = broker
         self.research = research
-        self.data_loader = data_loader or load_market_data
+        self.data_loader = data_loader or self._load_market_data
         self.state: InvestState | None = None
         self.engine: Engine | None = None
         self.execution = None
         self.running = True
         self.winding_down = False
         self._next_daily_try = 0.0
+        self._failures = 0
 
     # ================================================================ setup
     def now_et(self) -> datetime:
@@ -137,10 +139,17 @@ class InvestBot:
         self.store.save(state)
 
     # ============================================================ daily job
+    def _load_market_data(self, s, symbols, end):
+        st = self.state
+        return load_market_data(
+            s, symbols, end, fx_fallback=st.fx_rate or None,
+            last_day=date.fromisoformat(st.last_day) if st.last_day else None)
+
     def daily_job(self) -> bool:
         """Process every new closed day (simulator) or the latest one (real broker)."""
         s, st = self.s, self.state
-        today = self.now_et().date()
+        now = self.now_et()
+        today = now.date()
         symbols = data_symbols(st.universe, s.benchmark,
                                s.etp_underlying if s.etp_enabled else None)
         data = self.data_loader(s, symbols, today)
@@ -149,30 +158,40 @@ class InvestBot:
             raise RuntimeError(f"no {s.benchmark} bars from the data provider")
         last = pd.Timestamp(st.last_day) if st.last_day else None
         days = [d for d in bench.index if last is None or d > last]
+        ready = datetime.combine(today, SESSION_CLOSE, tzinfo=ET) \
+            + timedelta(minutes=s.eod_delay_minutes)
+        if now < ready:
+            days = [d for d in days if d.date() < today]  # today's bar is still forming
         if not days:
             return False
         if last is None or s.broker != "sim":
             days = days[-1:]  # never replay history against a real account
-        for day in days:
-            self.engine.process_day(day, data)
-            if st.status == "dead":
-                break
-        nxt = (pd.Timestamp(days[-1]) + pd.offsets.BDay(1)).date()
+        try:
+            for i, day in enumerate(days):
+                # Today's news says nothing about past days: no research on catch-up.
+                self.engine.research = self.research if i == len(days) - 1 else None
+                self.engine.process_day(day, data)
+                if st.status == "dead":
+                    break
+        finally:
+            self.engine.research = self.research
+        nxt = next_trading_day(pd.Timestamp(days[-1]).date())
         st.next_scan_at = int(datetime.combine(nxt, SESSION_CLOSE, tzinfo=ET).timestamp()
                               * 1000) + s.eod_delay_minutes * 60_000
         return True
 
     def in_session(self, now: datetime) -> bool:
-        return now.weekday() < 5 and SESSION_OPEN <= now.time() < SESSION_CLOSE
+        return is_trading_day(now.date()) and SESSION_OPEN <= now.time() < SESSION_CLOSE
 
     def daily_due(self, now: datetime) -> bool:
         if self.clock() < self._next_daily_try:
             return False
         if self.state.next_scan_at and self.clock() * 1000 < self.state.next_scan_at:
             return False  # the last close is processed; wait for the next one
+        if not is_trading_day(now.date()):
+            return True  # weekend or NYSE holiday: catch up any missed close
         after_close = (now + timedelta(minutes=-self.s.eod_delay_minutes)).time() >= SESSION_CLOSE
-        before_open = now.time() < SESSION_OPEN
-        return after_close or before_open or now.weekday() >= 5
+        return after_close or now.time() < SESSION_OPEN
 
     # ============================================================= intraday
     def intraday(self, now: datetime) -> None:
@@ -231,9 +250,16 @@ class InvestBot:
         log.critical("capital lost: liquidating, no new trade will ever be made")
         while True:  # at least one step, even with max_days=0
             try:
+                today = pd.Timestamp(self.now_et().date())
+                ex.sync(self.engine)  # learn first which sales were rejected or expired
                 ex.cancel_entries(self.engine)
+                for pos in list(self.state.positions.values()):
+                    if not ex.has_open_sell(pos.symbol):
+                        # The previous sale was rejected, cancelled or expired.
+                        ex.liquidate(self.engine, pos, today)
                 ex.submit_planned(self.engine)
-                ex.sync(self.engine)
+                if ex.refresh_account() is not None:
+                    ex.reconcile_positions(self.engine, today)  # sold by hand meanwhile
             except Exception as exc:  # keep trying: the account must end flat
                 log.exception("wind-down step failed: %s", exc)
             self.state.heartbeat = int(self.clock() * 1000)
@@ -259,10 +285,14 @@ class InvestBot:
         while self.running:
             try:
                 alive = self.cycle()
+                self._failures = 0
             except Exception as exc:  # data/network hiccups must not kill the process
                 log.exception("cycle failed: %s", exc)
                 self.store.log_decision("error", f"cycle failed: {exc}")
-                self._next_daily_try = self.clock() + 900
+                self._failures += 1
+                # 15 min, 30 min, 1 h ... up to 4 h between retries of the daily job.
+                self._next_daily_try = self.clock() + min(900 * 2 ** (self._failures - 1),
+                                                          4 * 3600)
                 alive = True
             if not alive:
                 return self.wind_down()
@@ -279,7 +309,10 @@ class InvestBot:
         if self.winding_down:
             return self.wind_down(max_days=0)  # one liquidation step per run
         if isinstance(self.execution, LiveExecution):
-            self.execution.sync(self.engine)
+            # Orders planned after the close are sent at the next open and stops are
+            # watched during the session: a one-shot run would leave them unsent.
+            raise ConfigError("--once only works with the simulator: run the bot "
+                              "continuously with a real broker (see README_INVEST.md)")
         self.daily_job()
         alive = self.state.status != "dead"
         if alive:
