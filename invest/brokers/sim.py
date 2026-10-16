@@ -63,9 +63,13 @@ class SimBroker:
         ts = session_ts(day, dtime(9, 30))
         orders = [OrderRequest.from_dict(o) for o in self.state.pending]
         orders.sort(key=lambda o: o.side != "SELL")  # sells first: they free cash
+        carried = []
         for o in orders:
             bar = self._bar(data, o.symbol, day)
             if bar is None:
+                if o.side == "SELL":
+                    carried.append(o.to_dict())  # no bar (halt, data gap): sell next session
+                    continue
                 o.status = "cancelled"
                 expired.append(o)
                 continue
@@ -87,7 +91,7 @@ class SimBroker:
                               fees_eur=self._fee_eur(o.qty, price, o.currency, fx),
                               usd_per_eur=fx, day=str(day.date()), ts=ts, reason=o.reason,
                               order=o.to_dict(), fill_id=o.id))
-        self.state.pending = []
+        self.state.pending = carried
         return fills, expired
 
     def settle_stops(self, day: pd.Timestamp, data, positions: dict) -> list[Fill]:
@@ -99,8 +103,11 @@ class SimBroker:
             bar = self._bar(data, sym, day)
             if bar is None or bar["low"] > pos.stop_loss:
                 continue
-            price = min(bar["open"], pos.stop_loss) * (1 - slip)
-            reason = stop_reason(float(price), pos.stop_loss, pos.entry_price, slip)
+            # A stop-market order fills worse when the market moves fast: scale with the
+            # stock's own volatility instead of a flat 5 bp.
+            stop_slip = max(slip, self.s.stop_slippage_atr * pos.atr / max(pos.stop_loss, 1e-9))
+            price = min(bar["open"], pos.stop_loss) * (1 - stop_slip)
+            reason = stop_reason(float(price), pos.stop_loss, pos.entry_price, stop_slip)
             fills.append(Fill(symbol=sym, side="SELL", qty=pos.qty, price=float(price),
                               fees_eur=self._fee_eur(pos.qty, price, pos.currency, fx),
                               usd_per_eur=fx, day=str(day.date()), ts=ts, reason=reason,

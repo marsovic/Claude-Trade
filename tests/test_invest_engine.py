@@ -118,10 +118,13 @@ def test_stop_loss_costs_about_the_planned_risk(tmp_path):
 def test_gap_through_stop_fills_at_open(tmp_path):
     bars, day, d1, sym, engine, state, store = entered(tmp_path)
     stop = state.positions[sym].stop_loss
+    atr = state.positions[sym].atr
     d2 = next_day(bars, d1)
     set_bar(bars, sym, d2, open=stop * 0.90, low=stop * 0.88, close=stop * 0.95)
     engine.process_day(d2, market_data(bars))
-    assert store.recent_trades()[-1]["exit_price"] == pytest.approx(stop * 0.90 * 0.9995)
+    # a stop-market order fills at the open less the slippage, which scales with volatility
+    slip = max(engine.s.slippage_bps / 1e4, engine.s.stop_slippage_atr * atr / stop)
+    assert store.recent_trades()[-1]["exit_price"] == pytest.approx(stop * 0.90 * (1 - slip))
 
 
 def test_survival_rule_liquidates_and_writes_tombstone(tmp_path):

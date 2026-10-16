@@ -23,17 +23,35 @@ from invest.portfolio import InvestPosition
 @dataclass
 class RiskBudget:
     risk_per_trade: float
-    slots: int
+    slots: int  # how many positions may be open
     etp_allowed: bool
     level: int  # 0 normal, 1 and 2 = drawdown ladder steps
+    weight_slots: int = 0  # the weight cap is 1/weight_slots, whatever the ladder says
+
+    def __post_init__(self):
+        self.weight_slots = self.weight_slots or self.slots
 
 
-def risk_budget(equity: float, drawdown: float, s) -> RiskBudget:
+def ladder_level(drawdown: float, previous: int, s) -> int:
+    """Drawdown ladder with hysteresis: a level is entered at its trigger and left only
+    once the drawdown is back under ``dd_release`` x the trigger, so the sizing does not
+    flip from one day to the next around -20 %."""
+    if drawdown >= s.dd_level2 or (previous >= 2 and drawdown >= s.dd_level2 * s.dd_release):
+        return 2
+    if drawdown >= s.dd_level1 or (previous >= 1 and drawdown >= s.dd_level1 * s.dd_release):
+        return 1
+    return 0
+
+
+def risk_budget(equity: float, drawdown: float, s, previous_level: int = 0) -> RiskBudget:
     slots = s.slots_small_equity if equity < s.small_equity else s.slots
-    if drawdown >= s.dd_level2:
-        return RiskBudget(min(s.risk_per_trade, 0.02), 1, False, 2)
-    if drawdown >= s.dd_level1:
-        return RiskBudget(min(s.risk_per_trade, 0.03), max(1, slots - 1), s.etp_enabled, 1)
+    level = ladder_level(drawdown, previous_level, s)
+    # De-risking must never make a position BIGGER: fewer slots, same weight cap.
+    if level == 2:
+        return RiskBudget(min(s.risk_per_trade, 0.02), 1, False, 2, weight_slots=slots)
+    if level == 1:
+        return RiskBudget(min(s.risk_per_trade, 0.03), max(1, slots - 1), s.etp_enabled, 1,
+                          weight_slots=slots)
     return RiskBudget(s.risk_per_trade, slots, s.etp_enabled, 0)
 
 
@@ -64,7 +82,7 @@ def size_position(price: float, atr: float, equity: float, cash: float, open_ris
         return None, "invalid price/equity"
     stop_pct = stop_distance_pct(price, atr, s)
     cap = max_weight if max_weight is not None else s.max_weight
-    weight = min(budget.risk_per_trade / stop_pct, 1 / budget.slots, cap)
+    weight = min(budget.risk_per_trade / stop_pct, 1 / budget.weight_slots, cap)
     risk_left = equity * s.max_open_risk - open_risk_eur
     if risk_left <= 0:
         return None, "total open risk limit reached"

@@ -144,6 +144,7 @@ class InvestSettings:
     time_stop_days: int = 30
     time_stop_min_r: float = 0.5
     rebalance_weekday: int = 4  # Friday close
+    dd_release: float = 0.6  # a drawdown level is left only below trigger x this (hysteresis)
     dd_level1: float = 0.20
     dd_level2: float = 0.35
     weekly_loss_pause: float = 0.08  # about two stops
@@ -151,6 +152,7 @@ class InvestSettings:
     max_entry_gap: float = 0.03  # buy limit = close * (1 + gap)
     max_cost_r: float = 0.15  # skip trades whose round trip costs more than this x R
     slippage_bps: float = 5.0
+    stop_slippage_atr: float = 0.1  # stop-market fills are worse in fast markets: 0.1 ATR
     fractional: bool = True  # broker allows fractional quantities
 
     # --- 3x leveraged ETP sleeve -------------------------------------------------------

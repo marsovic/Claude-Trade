@@ -135,6 +135,7 @@ class InvestState:
     fees_eur: float = 0.0
     fee_log: list[list] = field(default_factory=list)  # [day, eur] for the fee halt
     week_id: str = ""
+    dd_level: int = 0  # drawdown ladder level (hysteresis: it remembers where it was)
     week_start_equity: float = 0.0
     pause_until: str = ""
     daily_halt: bool = False  # True while new entries are paused (dashboard badge)

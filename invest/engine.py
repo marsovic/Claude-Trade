@@ -27,7 +27,7 @@ import pandas as pd
 from invest.brokers.base import Fill, OrderRequest
 from invest.brokers.sim import session_ts
 from invest.config import etp_symbol
-from invest.markets import sessions_until
+from invest.markets import next_trading_day, sessions_until
 from invest.portfolio import InvestPosition, InvestState, InvestTrade
 from invest.risk import (
     breakeven_stop,
@@ -214,7 +214,8 @@ class Engine:
                 highs[sym] = float(df.loc[day, "high"])
         for sym, pos in st.positions.items():
             if sym in highs:
-                pos.highest = max(pos.highest, highs[sym])
+                pos.highest = max(pos.highest, self._usable_high(pos, data, day, highs[sym],
+                                                                 prices[sym]))
         self.mark(prices)
         etp = data.bars.get(etp_symbol(s))
         if s.etp_enabled and s.broker == "sim" and etp is not None and day in etp.index:
@@ -264,7 +265,11 @@ class Engine:
         was_on = st.regime.get("on") if st.regime else None
         st.regime = regime.to_dict()
         evals = evaluate_day(panel, day, regime, s)
-        budget = risk_budget(equity, st.drawdown(), s)
+        budget = risk_budget(equity, st.drawdown(), s, previous_level=st.dd_level)
+        if budget.level != st.dd_level:
+            self._log("risk", f"drawdown {st.drawdown():.0%}: ladder level {st.dd_level} -> "
+                      f"{budget.level}", ts=close_ts)
+            st.dd_level = budget.level
         research_ok = self.research is not None and s.sentiment_enabled
         earnings = self.research.earnings_dates(day.date()) if research_ok else {}
 
@@ -315,7 +320,7 @@ class Engine:
         hold = row.get("pct_rank_hold", np.nan)
         hold = None if hold is None or np.isnan(hold) else float(hold)
         held = int(((feats.index > pd.Timestamp(pos.entry_day)) & (feats.index <= day)).sum())
-        if day.weekday() == s.rebalance_weekday:
+        if self._rebalance_day(day):
             if hold is None or hold < 1 - s.top_pct_hold:
                 return f"rank exit (fell out of the top {s.top_pct_hold:.0%})"
             if row["r6_1"] < 0:
@@ -331,6 +336,25 @@ class Engine:
         if pyramid_ok(pos, close, new_high, pct, s) and not regime.off:
             self._pyramid(day, pos, close, equity)
         return None
+
+    def _usable_high(self, pos, data, day, high: float, close: float) -> float:
+        """The day's high for the chandelier. A buy limit filled AFTER a gap-up (entry below
+        the open) must not inherit a high that came before the fill: that would create a
+        stop above prices the position never lived through."""
+        if pos.sleeve != "stock" or pos.entry_day != str(day.date()):
+            return high
+        df = data.bars.get(pos.symbol)
+        if df is None or day not in df.index:
+            return high
+        if pos.entry_price < float(df.loc[day, "open"]):
+            return min(high, max(pos.entry_price, close))
+        return high
+
+    def _rebalance_day(self, day) -> bool:
+        """Friday close, or the last session of the week when Friday is a market holiday."""
+        if self.s.rebalance_weekday != 4:
+            return day.weekday() == self.s.rebalance_weekday
+        return next_trading_day(day.date()).isocalendar()[:2] != day.date().isocalendar()[:2]
 
     def _pyramid(self, day, pos, close, equity) -> None:
         qty = pos.initial_qty * self.s.pyramid_fraction
