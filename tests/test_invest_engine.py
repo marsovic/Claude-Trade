@@ -224,14 +224,25 @@ def test_leveraged_etp_sleeve_in_calm_uptrend(tmp_path):
     bars["QQQ"] = calm_uptrend(bars, n)
     engine, state, store = make_engine(tmp_path, etp_enabled=True)
     day = bars["SPY"].index[400]
-    engine.process_day(day, market_data(bars))
+    vix = pd.Series(15.0, index=bars["SPY"].index)
+    engine.process_day(day, market_data(bars, vix=vix))
     sym = etp_symbol(engine.s)
     etp_orders = [o for o in state.pending if o["symbol"] == sym]
     assert etp_orders and etp_orders[0]["sleeve"] == "etp"
     d1 = next_day(bars, day)
-    engine.process_day(d1, market_data(bars))
+    engine.process_day(d1, market_data(bars, vix=vix))
     pos = state.positions[sym]
     assert pos.leverage == 3.0 and pos.cost_eur <= 100 * 0.33 + 1
+
+
+def test_no_leveraged_etp_without_vix(tmp_path):
+    bars = make_market()
+    n = len(bars["SPY"])
+    bars["SPY"] = calm_uptrend(bars, n)
+    bars["QQQ"] = calm_uptrend(bars, n)
+    engine, state, store = make_engine(tmp_path, etp_enabled=True)
+    engine.process_day(bars["SPY"].index[400], market_data(bars))
+    assert not any(o["symbol"].startswith("ETP:") for o in state.pending)
 
 
 def test_weekly_loss_pause(tmp_path):

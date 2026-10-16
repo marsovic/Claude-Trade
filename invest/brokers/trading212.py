@@ -29,6 +29,7 @@ import requests
 from invest.brokers.base import (
     AccountInfo,
     BrokerError,
+    BrokerOutcomeUnknown,
     BrokerPosition,
     LiveBroker,
     OrderRequest,
@@ -92,14 +93,20 @@ class Trading212Broker(LiveBroker):
                 if idempotent and attempt < 2:
                     self.sleep(2 * (attempt + 1))
                     continue
-                raise BrokerError(f"Trading 212 network error on {method} {path}: {exc} "
-                                  "(order outcome unknown: it will be reconciled)") from exc
+                if method == "POST":
+                    raise BrokerOutcomeUnknown(f"Trading 212 network error on {path}: {exc}") \
+                        from exc
+                raise BrokerError(f"Trading 212 network error on {method} {path}: {exc}") \
+                    from exc
             if resp.status_code == 429 and idempotent and attempt < 2:
                 reset = resp.headers.get("x-ratelimit-reset")
                 self.sleep(max(1.0, float(reset) - time.time()) if reset else 5.0)
                 continue
             if resp.status_code == 404 and method == "DELETE":
                 return None
+            if method == "POST" and (resp.status_code >= 500 or resp.status_code == 408):
+                # Order POSTs are not idempotent: the order may exist anyway.
+                raise BrokerOutcomeUnknown(f"Trading 212 HTTP {resp.status_code} on {path}")
             if resp.status_code >= 400:
                 raise BrokerError(f"Trading 212 HTTP {resp.status_code} on {path}: "
                                   f"{resp.text[:300]}")
@@ -167,9 +174,10 @@ class Trading212Broker(LiveBroker):
             resp = self._request("POST", "/equity/orders/market", "market",
                                  json={**body, "extendedHours": False})
         elif order.kind == "LIMIT":
+            # Entries live for one session only (DAY), stops until cancelled.
             resp = self._request("POST", "/equity/orders/limit", "limit", json={
                 **body, "limitPrice": round(float(order.limit_price), 4),
-                "timeValidity": "GOOD_TILL_CANCEL"})
+                "timeValidity": "DAY"})
         elif order.kind == "STOP":
             resp = self._request("POST", "/equity/orders/stop", "stop", json={
                 **body, "stopPrice": round(float(order.stop_price), 4),
@@ -206,8 +214,10 @@ class Trading212Broker(LiveBroker):
         bid = order.broker_id
         if bid in self._pending:
             row = self._pending[bid]
-            filled = float(row.get("filledQuantity", 0) or 0)
-            return OrderUpdate("partially_filled" if filled else "pending", filled_qty=filled)
+            filled = abs(float(row.get("filledQuantity", 0) or 0))
+            value = abs(float(row.get("filledValue", 0) or 0))
+            return OrderUpdate("partially_filled" if filled else "pending", filled_qty=filled,
+                               avg_price=value / filled if filled and value else 0.0)
         for item in self._history_items():
             o = item.get("order", {})
             if str(o.get("id")) != bid:

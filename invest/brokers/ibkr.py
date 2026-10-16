@@ -69,7 +69,9 @@ class IbkrBroker(LiveBroker):
         return contract
 
     def resolve(self, symbol: str) -> str | None:
-        return symbol if self._contract(symbol) is not None else None
+        # Same key as account() uses for positions (contract symbol, e.g. "QQQ3").
+        contract = self._contract(symbol)
+        return contract.symbol if contract is not None else None
 
     # --------------------------------------------------------------- account
     def account(self) -> AccountInfo:

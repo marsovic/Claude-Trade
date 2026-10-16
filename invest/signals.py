@@ -110,6 +110,9 @@ def build_panel(bars: dict[str, pd.DataFrame], universe: list[str], s) -> dict[s
     pct = score.rank(axis=1, pct=True)
     hold_score = sum(WEIGHTS[k] * _zscore(p.where(base)) for k, p in parts.items())
     hold_pct = hold_score.where(base).rank(axis=1, pct=True)
+    # Eligible stocks are judged in the same cross-section they were bought in; the
+    # base rank only rescues holdings that became ineligible (e.g. a big up-day).
+    hold_pct = pct.where(eligible, hold_pct)
     for sym, f in feats.items():
         f["eligible"] = eligible[sym].reindex(f.index).fillna(False).astype(bool)
         f["score"] = score[sym].reindex(f.index)
@@ -161,6 +164,8 @@ def regime_at(day: pd.Timestamp, bars: dict[str, pd.DataFrame], vix: pd.Series,
     v = _last(vix, day)
     v3 = _last(vix3m, day)
     term = v / v3 if v is not None and v3 else None
+    if v is None:
+        reasons.append("VIX unavailable: VIX gates skipped, no leveraged ETP entry")
     on = above
     if not above:
         reasons.append(f"{s.benchmark} below its {s.regime_sma}-day SMA")
@@ -300,7 +305,9 @@ def etp_entry_ok(under: pd.Series, regime: Regime, s) -> tuple[bool, str]:
     needed = (1.5 * sigma2 + 0.03) if lev >= 3 else (sigma2 + 0.02)
     if not trend >= needed:
         return False, f"trend {trend:.0%} too weak for x{lev:g} (needs {needed:.0%})"
-    if regime.vix is not None and regime.vix >= s.etp_vix_max:
+    if regime.vix is None:
+        return False, "VIX unavailable: no leveraged entry without it"
+    if regime.vix >= s.etp_vix_max:
         return False, f"VIX {regime.vix:.1f} >= {s.etp_vix_max:g}"
     return True, "calm uptrend"
 

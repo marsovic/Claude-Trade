@@ -80,6 +80,13 @@ class BrokerError(RuntimeError):
     pass
 
 
+class BrokerOutcomeUnknown(BrokerError):
+    """An order POST may or may not have reached the broker (timeout, reset, 5xx).
+
+    Such an order must be looked up at the broker, never sent again.
+    """
+
+
 class LiveBroker:
     """Interface implemented by Trading 212, Alpaca and IBKR adapters."""
 

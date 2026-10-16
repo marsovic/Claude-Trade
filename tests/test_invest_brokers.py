@@ -8,7 +8,7 @@ import pytest
 import requests
 
 from invest.brokers.alpaca import AlpacaBroker
-from invest.brokers.base import BrokerError, OrderRequest
+from invest.brokers.base import BrokerError, BrokerOutcomeUnknown, OrderRequest
 from invest.brokers.ibkr import IbkrBroker
 from invest.brokers.trading212 import Trading212Broker, floor_qty
 
@@ -69,7 +69,7 @@ def test_t212_order_bodies():
     assert b.submit(buy) == "2"
     assert b.session.calls[-1][2] == {"ticker": "NVDA_US_EQ", "quantity": 0.5,
                                       "limitPrice": 123.4568,
-                                      "timeValidity": "GOOD_TILL_CANCEL"}
+                                      "timeValidity": "DAY"}  # entries: one session only
     stop = OrderRequest("NVDA", "SELL", 0.5, kind="STOP", stop_price=100.0,
                         broker_ticker="NVDA_US_EQ")
     b.submit(stop)
@@ -79,9 +79,13 @@ def test_t212_order_bodies():
 
 def test_t212_orders_are_never_retried():
     b = t212({("POST", "/equity/orders/market"): requests.ConnectionError("reset")})
-    with pytest.raises(BrokerError, match="outcome unknown"):
+    with pytest.raises(BrokerOutcomeUnknown):
         b.submit(OrderRequest("AMD", "BUY", 1, broker_ticker="AMD_US_EQ"))
     assert len(b.session.calls) == 1
+    b5 = t212({("POST", "/equity/orders/limit"): Resp(504, {"error": "gateway"})})
+    with pytest.raises(BrokerOutcomeUnknown):  # a 5xx answer may hide an accepted order
+        b5.submit(OrderRequest("AMD", "BUY", 1, kind="LIMIT", limit_price=1.0,
+                               broker_ticker="AMD_US_EQ"))
 
 
 def test_t212_get_retries_on_429_and_parses_account():

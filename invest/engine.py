@@ -26,6 +26,7 @@ import pandas as pd
 from invest.brokers.base import Fill, OrderRequest
 from invest.brokers.sim import session_ts
 from invest.config import etp_symbol
+from invest.markets import sessions_until
 from invest.portfolio import InvestPosition, InvestState, InvestTrade
 from invest.risk import (
     breakeven_stop,
@@ -57,7 +58,7 @@ class Engine:
         self.exec = execution
         self.research = research
         self.ledger = ledger
-        self.fx_now = s.eurusd_fallback
+        self.fx_now = state.fx_rate or s.eurusd_fallback  # persisted across restarts
         self.day: pd.Timestamp | None = None
 
     # ================================================================ fills
@@ -65,6 +66,16 @@ class Engine:
         return fx if currency == "USD" else 1.0
 
     def apply_fill(self, f: Fill) -> None:
+        st = self.state
+        if f.fill_id:
+            if f.fill_id in st.seen_fills:
+                self._log("warning", f"fill {f.fill_id} already booked: ignored", f.symbol)
+                return
+            st.seen_fills = (st.seen_fills + [f.fill_id])[-2000:]
+        self._book(f)
+        self.store.save(st)  # journals and state stay consistent if the process dies
+
+    def _book(self, f: Fill) -> None:
         st = self.state
         order = OrderRequest.from_dict(f.order) if f.order else None
         if f.side == "BUY":
@@ -108,7 +119,7 @@ class Engine:
             if self.ledger:
                 self.ledger.record(day=f.day, symbol=f.symbol, side="BUY", qty=f.qty,
                                    price=f.price, currency=currency, usd_per_eur=f.usd_per_eur,
-                                   gross_eur=gross, fees_eur=f.fees_eur)
+                                   gross_eur=gross, fees_eur=f.fees_eur, fill_id=f.fill_id)
             self.exec.on_stop_change(self, pos)
             return
 
@@ -145,7 +156,7 @@ class Engine:
             self.ledger.record(day=f.day, symbol=f.symbol, side="SELL", qty=qty, price=f.price,
                                currency=pos.currency, usd_per_eur=f.usd_per_eur,
                                gross_eur=gross, fees_eur=f.fees_eur, cost_basis_eur=cost_part,
-                               gain_eur=pnl)
+                               gain_eur=pnl, fill_id=f.fill_id)
         self._log("close", f"{f.reason}: SELL {qty:g} @ {f.price:.4g}, {pnl:+.2f} EUR "
                   f"({trade.r_multiple:+.2f}R)", f.symbol, trade.to_dict(), ts=f.ts)
 
@@ -181,6 +192,7 @@ class Engine:
         day = pd.Timestamp(day).normalize()
         self.day = day
         self.fx_now = data.fx(day)
+        st.fx_rate = self.fx_now
         close_ts = session_ts(day, dtime(16, 0))
 
         if s.etp_enabled and s.broker == "sim":
@@ -202,7 +214,19 @@ class Engine:
         etp = data.bars.get(etp_symbol(s))
         if s.etp_enabled and s.broker == "sim" and etp is not None and day in etp.index:
             st.etp_anchor = [str(day.date()), float(etp.loc[day, "close"])]
+        own = self.equity()
         equity = self.equity(self.exec.broker_equity())
+        suspicious = equity <= s.survival_floor < own
+        if suspicious:
+            # Only the broker's reading is under the floor: confirm before dying.
+            st.floor_breaches += 1
+            if st.floor_breaches < 2:
+                self._log("warning", f"broker equity {equity:.2f} EUR vs {own:.2f} EUR in "
+                          "the bot's books: entries paused, confirming next check",
+                          ts=close_ts)
+                equity = own
+        elif equity > s.survival_floor:
+            st.floor_breaches = 0
         st.record_equity(close_ts, equity)
         st.last_day = str(day.date())
 
@@ -227,7 +251,7 @@ class Engine:
         if fee_halt:
             self._log("halt", "fees over the last 3 months exceed 5 % of equity: entries "
                       "paused", ts=close_ts)
-        st.daily_halt = self._paused(day) or fee_halt
+        st.daily_halt = self._paused(day) or fee_halt or suspicious
 
         # 3) signals
         panel = panel if panel is not None else build_panel(data.bars, st.universe, s)
@@ -310,10 +334,12 @@ class Engine:
         notional = qty * close / self._rate(pos.currency, self.fx_now)
         if qty <= 0 or notional > self._free_cash():
             return
+        stop_pct = max((close - pos.stop_loss) / close, self.s.stop_min_pct)
         order = OrderRequest(symbol=pos.symbol, side="BUY", qty=qty, kind="LIMIT",
                              limit_price=close * (1 + self.s.max_entry_gap), reason="add",
-                             sleeve="stock", currency=pos.currency,
-                             broker_ticker=pos.broker_ticker, day=str(day.date()))
+                             sleeve="stock", currency=pos.currency, stop_pct=stop_pct,
+                             atr=pos.atr, broker_ticker=pos.broker_ticker,
+                             day=str(day.date()))
         if self.exec.queue(self, order):
             self._log("order", f"pyramid BUY {qty:g} (+{self.s.pyramid_fraction:.0%}) at "
                       f"+{pos.r_multiple(close):.1f}R", pos.symbol)
@@ -378,7 +404,8 @@ class Engine:
     def _veto(self, day, ev, earnings) -> str | None:
         s = self.s
         report = earnings.get(ev.symbol)
-        if report and self._sessions_until(day, report) <= s.earnings_blackout_days:
+        # One session wider than the exit window, or a fresh entry is sold next day.
+        if report and self._sessions_until(day, report) <= s.earnings_blackout_days + 1:
             return f"earnings on {report}: no entry right before results"
         if self.research is None or not s.sentiment_enabled:
             return None
@@ -393,14 +420,16 @@ class Engine:
         s = self.s
         under = data.bars.get(s.etp_underlying)
         etp = data.bars.get(etp_symbol(s))
-        if under is None or under.empty or etp is None or etp.empty:
+        if under is None or under.empty:
             return None, None
-        key = (id(under), id(etp), len(under), len(etp))
+        if etp is not None and etp.empty:
+            etp = None
+        key = (id(under), id(etp), len(under), 0 if etp is None else len(etp))
         if getattr(self, "_etp_cache_key", None) != key:
             bench = data.bars.get(s.benchmark)
             bench_close = bench["close"] if bench is not None else None
             self._etp_cache = (symbol_features(under, bench_close, s),
-                               symbol_features(etp, bench_close, s))
+                               None if etp is None else symbol_features(etp, bench_close, s))
             self._etp_cache_key = key
         return self._etp_cache
 
@@ -411,6 +440,9 @@ class Engine:
         reason = etp_exit_reason(under_f.loc[day], regime, self.s)
         if reason:
             return f"ETP exit: {reason}"
+        if etp_f is None:
+            self._log("warning", "ETP price series missing today: exit rules checked on the "
+                      "underlying, stop not moved", pos.symbol)
         if etp_f is not None and day in etp_f.index:
             atr = float(etp_f.loc[day, "atr"])
             new_stop = chandelier_stop(pos, atr, self.s)
@@ -427,7 +459,8 @@ class Engine:
         if sym in st.positions or any(o["symbol"] == sym for o in st.pending):
             return
         under_f, etp_f = self._etp_frames(data)
-        if under_f is None or day not in under_f.index or day not in etp_f.index:
+        if under_f is None or etp_f is None or day not in under_f.index \
+                or day not in etp_f.index:
             return
         ok, why = etp_entry_ok(under_f.loc[day], regime, s)
         if not ok:
@@ -526,8 +559,7 @@ class Engine:
 
     @staticmethod
     def _sessions_until(day, report) -> int:
-        start = (day + pd.Timedelta(days=1)).date()
-        return int(np.busday_count(start, report)) + 1 if report >= start else 0
+        return sessions_until(pd.Timestamp(day).date(), report)
 
     def _free_cash(self) -> float:
         reserved = 0.0

@@ -304,4 +304,9 @@ def test_tax_summary(tmp_path):
     assert summary["estimated_pfu_eur"] == pytest.approx(14.57 * 0.314, abs=0.01)
     assert ledger.summary(2025)["sales"] == 0
     out = ledger.export_csv(2026, tmp_path / "t.csv")
-    assert out.read_text().startswith("day,")
+    assert out.read_text().startswith("fill_id,day,")
+    ledger.record(day="2026-04-01", symbol="AMD", side="SELL", qty=1, price=1, currency="USD",
+                  usd_per_eur=1.1, gross_eur=1, fees_eur=0, fill_id="x1")
+    ledger.record(day="2026-04-01", symbol="AMD", side="SELL", qty=1, price=1, currency="USD",
+                  usd_per_eur=1.1, gross_eur=1, fees_eur=0, fill_id="x1")
+    assert sum(1 for r in TaxLedger(tmp_path).rows() if r.get("fill_id") == "x1") == 1

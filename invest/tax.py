@@ -33,13 +33,23 @@ class TaxLedger:
 
     def record(self, *, day: str, symbol: str, side: str, qty: float, price: float,
                currency: str, usd_per_eur: float, gross_eur: float, fees_eur: float,
-               cost_basis_eur: float = 0.0, gain_eur: float = 0.0) -> None:
-        row = {"day": day, "symbol": symbol, "side": side, "qty": qty, "price": price,
+               cost_basis_eur: float = 0.0, gain_eur: float = 0.0, fill_id: str = "") -> None:
+        if fill_id and fill_id in self._ids():
+            return  # the same execution is never declared twice
+        row = {"fill_id": fill_id, "day": day, "symbol": symbol, "side": side, "qty": qty,
+               "price": price,
                "currency": currency, "usd_per_eur": usd_per_eur,
                "gross_eur": round(gross_eur, 6), "fees_eur": round(fees_eur, 6),
                "cost_basis_eur": round(cost_basis_eur, 6), "gain_eur": round(gain_eur, 6)}
         with self.path.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(row) + "\n")
+        if fill_id:
+            self._ids().add(fill_id)
+
+    def _ids(self) -> set[str]:
+        if getattr(self, "_seen", None) is None:
+            self._seen = {r.get("fill_id") for r in self.rows() if r.get("fill_id")}
+        return self._seen
 
     def rows(self) -> list[dict]:
         if not self.path.exists():

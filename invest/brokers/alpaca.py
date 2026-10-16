@@ -22,6 +22,7 @@ import requests
 from invest.brokers.base import (
     AccountInfo,
     BrokerError,
+    BrokerOutcomeUnknown,
     BrokerPosition,
     LiveBroker,
     OrderRequest,
@@ -52,12 +53,20 @@ class AlpacaBroker(LiveBroker):
         self.fx = fx or (lambda: 1.10)
 
     def _request(self, method: str, path: str, **kwargs):
+        posting = method == "POST" and path == "/orders"
         try:
             resp = self.session.request(method, self.base + path, timeout=20, **kwargs)
         except requests.RequestException as exc:
+            if posting:
+                raise BrokerOutcomeUnknown(f"Alpaca network error on POST /orders: {exc}") \
+                    from exc
             raise BrokerError(f"Alpaca network error on {method} {path}: {exc}") from exc
         if resp.status_code == 404 and method == "DELETE":
             return None
+        if posting and (resp.status_code >= 500 or (
+                resp.status_code == 422 and "client_order_id" in resp.text)):
+            # 5xx, or a resend of an order Alpaca already has: look it up by its id.
+            raise BrokerOutcomeUnknown(f"Alpaca HTTP {resp.status_code} on POST /orders")
         if resp.status_code >= 400:
             raise BrokerError(f"Alpaca HTTP {resp.status_code} on {path}: {resp.text[:300]}")
         return resp.json() if resp.content else None

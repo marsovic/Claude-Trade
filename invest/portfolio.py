@@ -157,6 +157,7 @@ class InvestState:
     etp_anchor: list = field(default_factory=list)  # [day, price] of the synthetic ETP
     floor_breaches: int = 0  # consecutive intraday readings below the survival floor
     applied_splits: list[str] = field(default_factory=list)  # "SYM:YYYY-MM-DD"
+    fx_rate: float = 0.0  # last known USD per EUR (survives restarts)
 
     @classmethod
     def fresh(cls, mode: str, capital: float) -> InvestState:

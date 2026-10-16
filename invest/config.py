@@ -245,6 +245,9 @@ class InvestSettings:
             raise ConfigError("weights must be in (0, 1]; no margin (INV_MAX_GROSS <= 1)")
         if not 0 < self.top_pct_entry <= self.top_pct_hold <= 1:
             raise ConfigError("need 0 < TOP_PCT_ENTRY <= TOP_PCT_HOLD <= 1")
+        if self.etp_currency not in ("EUR", "USD"):
+            raise ConfigError("INV_ETP_CURRENCY must be EUR or USD (pick an ETP line quoted "
+                              "in one of them; GBP/GBX lines are not supported)")
         if self.etp_leverage not in (1.0, 2.0, 3.0):
             raise ConfigError("INV_ETP_LEVERAGE must be 1, 2 or 3")
         if self.data_provider == "csv" and not self.csv_dir:

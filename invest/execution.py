@@ -26,9 +26,16 @@ from datetime import datetime
 
 import pandas as pd
 
-from invest.brokers.base import BrokerError, Fill, LiveBroker, OrderRequest
+from invest.brokers.base import (
+    BrokerError,
+    BrokerOutcomeUnknown,
+    Fill,
+    LiveBroker,
+    OrderRequest,
+)
 from invest.brokers.sim import SimBroker
 from invest.data import ET
+from invest.markets import split_ratio
 
 log = logging.getLogger("invest")
 
@@ -80,7 +87,8 @@ class SimExecution:
         fees = self.broker._fee_eur(pos.qty, price, pos.currency, fx)
         engine.apply_fill(Fill(symbol=pos.symbol, side="SELL", qty=pos.qty, price=price,
                                fees_eur=fees, usd_per_eur=fx, day=str(day.date()),
-                               ts=int(pd.Timestamp(day).timestamp() * 1000), reason="death"))
+                               ts=int(pd.Timestamp(day).timestamp() * 1000), reason="death",
+                               fill_id=f"death:{pos.symbol}:{day.date()}"))
 
     def broker_equity(self) -> float | None:
         return None
@@ -91,7 +99,9 @@ class SimExecution:
 
 class LiveExecution:
     UNKNOWN_LIMIT = 5  # syncs before an order the broker does not know is dropped
-    SUBMIT_ATTEMPTS = 3
+    SUBMIT_ATTEMPTS = 3  # for BUYs; SELLs are never abandoned
+    CANCEL_RETRY_MS = 5 * 60_000  # re-send a cancellation the broker ignored
+    STOP_BLOCK_MS = 30 * 60_000  # after a rejected stop, watch the position ourselves
 
     def __init__(self, s, state, store, broker: LiveBroker, clock=time.time):
         self.s = s
@@ -102,9 +112,13 @@ class LiveExecution:
         self.fractional = broker.fractional and s.fractional
         self._tickers: dict[str, str | None] = {}
         self._unknown: dict[str, int] = {}
+        self._stop_block: dict[str, int] = {}  # symbol -> ms until which no stop is sent
         self._account = None
 
     # ------------------------------------------------------------ helpers
+    def _now(self) -> int:
+        return int(self.clock() * 1000)
+
     def _log(self, kind, message, symbol=None):
         self.store.log_decision(kind, message, symbol, "LONG" if symbol else None)
         log.info("%s %s %s", kind, symbol or "", message)
@@ -152,6 +166,11 @@ class LiveExecution:
         sent = any(od["kind"] != "STOP" for od in self._open_for(symbol, "SELL"))
         return planned or sent
 
+    def busy(self) -> bool:
+        unprotected = self.broker.resting_stops and any(
+            not p.stop_order_id for p in self.state.positions.values())
+        return bool(self.state.pending or self.state.open_orders or unprotected)
+
     # ------------------------------------------------------------- orders
     def queue(self, engine, order: OrderRequest) -> bool:
         if order.side == "SELL" and self.has_open_sell(order.symbol):
@@ -169,18 +188,16 @@ class LiveExecution:
         self.state.open_orders[order.id] = {**order.to_dict(), **extra}
 
     def _submit(self, order: OrderRequest) -> bool:
-        """Send one order. A timeout is tracked as 'unconfirmed', never resent."""
-        submitted_at = int(self.clock() * 1000)
+        """Send one order. An unknown outcome is tracked as 'unconfirmed', never resent."""
+        submitted_at = self._now()
         try:
             order.broker_id = self._call(self.broker.submit, order)
-        except BrokerError as exc:
-            if "outcome unknown" in str(exc):
-                order.status = "unconfirmed"
-                self._track(order, submitted_at=submitted_at)
-                self._log("warning", f"{order.side} {order.qty:g} outcome unknown: it will "
-                          "be looked up at the broker, not resent", order.symbol)
-                return True
-            raise
+        except BrokerOutcomeUnknown as exc:
+            order.status = "unconfirmed"
+            self._track(order, submitted_at=submitted_at)
+            self._log("warning", f"{order.side} {order.qty:g} outcome unknown ({exc}): it will "
+                      "be looked up at the broker, not resent", order.symbol)
+            return True
         order.status = "submitted"
         self._track(order, submitted_at=submitted_at)
         return True
@@ -195,10 +212,16 @@ class LiveExecution:
         for o in orders:
             raw = next(p for p in self.state.pending if p["id"] == o.id)
             if o.side == "BUY":
+                if self.state.status == "dead":
+                    continue
                 if self.state.last_day and o.day and o.day < self.state.last_day:
                     self._log("skip", f"entry planned on {o.day} is stale: dropped", o.symbol)
                     continue
                 if o.reason == "entry" and o.symbol in self.state.positions:
+                    continue
+                if o.reason == "add" and o.symbol not in self.state.positions:
+                    self._log("skip", "position closed meanwhile: pyramid add dropped",
+                              o.symbol)
                     continue
             else:
                 pos = self.state.positions.get(o.symbol)
@@ -216,8 +239,8 @@ class LiveExecution:
                 attempts = raw.get("attempts", 0) + 1
                 self._log("error", f"{o.side} {o.qty:g} failed (attempt {attempts}): {exc}",
                           o.symbol)
-                if attempts < self.SUBMIT_ATTEMPTS:
-                    keep.append({**raw, "attempts": attempts})
+                if o.side == "SELL" or attempts < self.SUBMIT_ATTEMPTS:
+                    keep.append({**raw, "attempts": attempts})  # an exit is never given up
                 continue
             sent += 1
             self._log("order", f"sent {o.side} {o.kind} {o.qty:g}"
@@ -227,19 +250,36 @@ class LiveExecution:
         self.ensure_stops(engine)
         return sent
 
+    def cancel_stale_entries(self, today) -> None:
+        """Working BUYs from an earlier session are cancelled (one session only)."""
+        for od in list(self.state.open_orders.values()):
+            if od["side"] != "BUY" or not od.get("broker_id") or od.get("cancel_requested"):
+                continue
+            sent_day = datetime.fromtimestamp(od.get("submitted_at", 0) / 1000, tz=ET).date()
+            if sent_day < today:
+                self._cancel_record(od, "entry from a previous session: cancelled")
+
+    def _cancel_record(self, od: dict, why: str) -> None:
+        try:
+            self._call(self.broker.cancel, od["broker_id"])
+            od["cancel_requested"] = True
+            od["cancel_requested_at"] = self._now()
+            self._log("skip", why, od["symbol"])
+        except BrokerError as exc:
+            self._log("error", f"could not cancel: {exc}", od["symbol"])
+
     # -------------------------------------------------------------- stops
     def _request_stop_cancel(self, pos) -> None:
         od = self.state.open_orders.get(pos.stop_order_id)
         if od is None:
             pos.stop_order_id = ""
             return
-        if od.get("cancel_requested"):
-            return
-        if not od.get("broker_id"):
-            return  # unconfirmed stop: wait until sync finds it
+        if od.get("cancel_requested") or not od.get("broker_id"):
+            return  # already asked, or unconfirmed: wait until sync finds it
         try:
             self._call(self.broker.cancel, od["broker_id"])
             od["cancel_requested"] = True
+            od["cancel_requested_at"] = self._now()
         except BrokerError as exc:
             self._log("error", f"could not cancel the stop: {exc}", pos.symbol)
 
@@ -269,6 +309,8 @@ class LiveExecution:
                     self._request_stop_cancel(pos)
                 continue
             pos.stop_order_id = ""
+            if self._stop_block.get(sym, 0) > self._now():
+                continue  # the broker rejected it recently: the bot watches it
             order = OrderRequest(symbol=sym, side="SELL", qty=qty, kind="STOP",
                                  stop_price=pos.stop_loss, reason="stop", sleeve=pos.sleeve,
                                  currency=pos.currency, broker_ticker=pos.broker_ticker)
@@ -283,21 +325,26 @@ class LiveExecution:
     def on_position_closed(self, engine, pos, fill) -> None:
         if pos.stop_order_id and pos.stop_order_id != (fill.order or {}).get("id"):
             self._request_stop_cancel(pos)
+        # No pyramid add may re-open a position the market just closed.
+        self.state.pending = [o for o in self.state.pending
+                              if not (o["symbol"] == pos.symbol and o["side"] == "BUY")]
+        for od in self._open_for(pos.symbol, "BUY"):
+            if od.get("broker_id") and not od.get("cancel_requested"):
+                self._cancel_record(od, "position closed: pending add cancelled")
 
     def cancel_entries(self, engine) -> None:
         """Death: no new exposure, ever. Planned and working buys are cancelled."""
         self.state.pending = [o for o in self.state.pending if o["side"] != "BUY"]
         for od in list(self.state.open_orders.values()):
             if od["side"] == "BUY" and od.get("broker_id") and not od.get("cancel_requested"):
-                try:
-                    self._call(self.broker.cancel, od["broker_id"])
-                    od["cancel_requested"] = True
-                except BrokerError as exc:
-                    self._log("error", f"could not cancel entry, CANCEL IT BY HAND: {exc}",
-                              od["symbol"])
+                self._cancel_record(od, "death: entry cancelled")
 
     def liquidate(self, engine, pos, day) -> None:
-        """Queue a market sale; it is sent as soon as the stop is confirmed cancelled."""
+        """Plan a market sale; it is sent once the stop is confirmed cancelled."""
+        if self.has_open_sell(pos.symbol) and any(
+                o["symbol"] == pos.symbol and o.get("reason") == "death"
+                for o in self.state.pending):
+            return
         order = OrderRequest(symbol=pos.symbol, side="SELL", qty=pos.qty, kind="MARKET",
                              reason="death", sleeve=pos.sleeve, currency=pos.currency,
                              broker_ticker=pos.broker_ticker)
@@ -305,12 +352,10 @@ class LiveExecution:
         self.state.pending.append(order.to_dict())
         self._log("order", f"liquidation SELL {pos.qty:g} planned", pos.symbol)
 
-    def busy(self) -> bool:
-        return bool(self.state.pending or self.state.open_orders)
-
     # ---------------------------------------------------------- reconcile
     def sync(self, engine) -> int:
         if not self.state.open_orders:
+            self.ensure_stops(engine)  # retry stops that failed earlier
             return 0
         try:
             self._call(self.broker.begin_sync)
@@ -318,6 +363,7 @@ class LiveExecution:
             self._log("error", f"sync failed: {exc}")
             return 0
         applied = 0
+        now = self._now()
         for oid, od in list(self.state.open_orders.items()):
             o = OrderRequest.from_dict(od)
             try:
@@ -332,6 +378,12 @@ class LiveExecution:
                 self._log("error", f"order status unavailable: {exc}", o.symbol)
                 continue
             applied += self._apply_update(engine, oid, od, o, upd)
+            if (oid in self.state.open_orders and od.get("cancel_requested")
+                    and now - od.get("cancel_requested_at", now) > self.CANCEL_RETRY_MS):
+                od["cancel_requested"] = False  # the broker ignored it: ask again
+                self._log("warning", "cancellation not confirmed after 5 min: re-sent",
+                          o.symbol)
+                self._cancel_record(od, "cancellation re-sent")
         self.ensure_stops(engine)
         return applied
 
@@ -351,17 +403,24 @@ class LiveExecution:
         increment = total - applied_qty
         terminal = upd.status in ("filled", "cancelled", "rejected")
         if increment > 1e-9:
-            if upd.avg_price <= 0 and not (o.limit_price or o.stop_price):
-                self._log("warning", "fill without a price yet: retried next sync", o.symbol)
-                return 0
-            if o.kind == "STOP" and o.symbol in self.state.positions:
-                pos = self.state.positions[o.symbol]
-                if pos.stop_order_id == oid and terminal:
+            if upd.avg_price <= 0 and not (upd.status == "filled"
+                                           and (o.limit_price or o.stop_price)):
+                return 0  # partial fill without a price yet: wait for the next sync
+            avg = upd.avg_price or o.limit_price or o.stop_price
+            # Brokers report cumulative averages: price only the new shares.
+            value = avg * total - od.get("applied_value", 0.0)
+            price = value / increment if value > 0 else avg
+            fees = max(upd.fees_eur - od.get("applied_fees", 0.0), 0.0)
+            od.update(applied_qty=total, applied_value=avg * total,
+                      applied_fees=max(upd.fees_eur, od.get("applied_fees", 0.0)))
+            if o.kind == "STOP" and terminal:
+                pos = self.state.positions.get(o.symbol)
+                if pos is not None and pos.stop_order_id == oid:
                     pos.stop_order_id = ""
-            od["applied_qty"] = total
             if terminal:
                 del self.state.open_orders[oid]
-            engine.apply_fill(self._fill(engine, o, upd, increment))
+            engine.apply_fill(self._fill(engine, o, upd, increment, price, fees,
+                                         f"{o.broker_id}:{total:.8f}"))
             return 1
         if terminal:
             del self.state.open_orders[oid]
@@ -370,24 +429,23 @@ class LiveExecution:
                 if pos and pos.stop_order_id == oid:
                     pos.stop_order_id = ""
                     if not od.get("cancel_requested"):
-                        self._log("warning", f"stop {upd.status} by the broker: watched by "
-                                  "the bot until it is placed again", o.symbol)
+                        self._stop_block[o.symbol] = self._now() + self.STOP_BLOCK_MS
+                        self._log("warning", f"stop {upd.status} by the broker: the bot "
+                                  "watches it for 30 min before trying again", o.symbol)
             elif not od.get("cancel_requested"):
                 engine.on_order_dead(o, upd.status)
         elif upd.status == "unknown":
             self._unconfirmed_miss(oid, o)
         return 0
 
-    def _fill(self, engine, o: OrderRequest, upd, qty: float) -> Fill:
-        price = upd.avg_price or o.limit_price or o.stop_price or 0.0
+    def _fill(self, engine, o: OrderRequest, upd, qty: float, price: float, fees: float,
+              fill_id: str) -> Fill:
         fx = engine.fx_now
-        fees = upd.fees_eur * (qty / upd.filled_qty) if upd.fees_eur and upd.filled_qty \
-            else 0.0
         if not fees:
             foreign = o.currency != "EUR"
             cost = self.s.fees.cost(qty, price, foreign)
             fees = cost / fx if foreign else cost
-        ts = upd.filled_at or int(self.clock() * 1000)
+        ts = upd.filled_at or self._now()
         day = datetime.fromtimestamp(ts / 1000, tz=ET).date()
         reason = o.reason
         if o.kind == "STOP":
@@ -396,30 +454,39 @@ class LiveExecution:
                 else "stop"
         return Fill(symbol=o.symbol, side=o.side, qty=qty, price=price, fees_eur=fees,
                     usd_per_eur=fx, day=str(day), ts=ts, reason=reason, order=o.to_dict(),
-                    fill_id=o.broker_id)
+                    fill_id=fill_id)
 
     def settle(self, engine, day, data) -> None:
-        """End of day: reconcile fills, cancel unfilled entries, detect manual closes."""
+        """End of day: reconcile fills, cancel unfilled entries, check the broker's books."""
         self.sync(engine)
         for od in list(self.state.open_orders.values()):
             if od["side"] == "BUY" and od.get("broker_id") and not od.get("cancel_requested"):
-                try:
-                    self._call(self.broker.cancel, od["broker_id"])
-                    od["cancel_requested"] = True
-                    self._log("skip", "entry not filled today: cancelled", od["symbol"])
-                except BrokerError as exc:
-                    self._log("error", f"could not cancel stale entry: {exc}", od["symbol"])
+                self._cancel_record(od, "entry not filled today: cancelled")
         self.sync(engine)
-        account = self.refresh_account()
-        if account is None:
-            return
-        held = {p.ticker for p in account.positions.values() if p.qty > 0}
+        if self.refresh_account() is not None:
+            self.reconcile_positions(engine, day)
+
+    def reconcile_positions(self, engine, day) -> None:
+        """Splits seen in the broker's quantities, and positions closed by hand."""
+        account = self._account
+        held = {p.ticker: p for p in account.positions.values() if p.qty > 0}
         missing = self.state.missing_checks
         for sym, pos in list(self.state.positions.items()):
-            busy = self._open_for(sym, "SELL") and any(
-                od["kind"] != "STOP" for od in self._open_for(sym, "SELL"))
-            if not pos.broker_ticker or pos.broker_ticker in held or busy:
+            bp = held.get(pos.broker_ticker)
+            if bp is not None:
                 missing.pop(sym, None)
+                ratio = split_ratio(bp.qty / pos.qty) if pos.qty else None
+                if ratio:
+                    key = f"{sym}:{day.date()}"
+                    if key not in self.state.applied_splits:
+                        self.state.applied_splits.append(key)
+                        pos.apply_split(ratio)
+                        self._log("split", f"broker holds {bp.qty:g} shares for {pos.qty / ratio:g}"
+                                  f": {ratio:g}-for-1 split applied", sym)
+                        self.ensure_stops(engine, only=sym)
+                continue
+            busy = any(od["kind"] != "STOP" for od in self._open_for(sym, "SELL"))
+            if not pos.broker_ticker or busy:
                 continue
             missing[sym] = missing.get(sym, 0) + 1
             if missing[sym] < 2:
@@ -434,8 +501,8 @@ class LiveExecution:
             engine.apply_fill(Fill(symbol=sym, side="SELL", qty=pos.qty,
                                    price=pos.last_price, fees_eur=0.0,
                                    usd_per_eur=engine.fx_now, day=str(day.date()),
-                                   ts=int(self.clock() * 1000),
-                                   reason="closed outside the bot"))
+                                   ts=self._now(), reason="closed outside the bot",
+                                   fill_id=f"external:{sym}:{day.date()}"))
 
     def check_monitored_stops(self, engine, prices: dict[str, float]) -> None:
         """Positions without a resting stop: sell when the last price breaks it."""
@@ -457,10 +524,23 @@ class LiveExecution:
                       "SELL at market", sym)
 
     def broker_prices(self) -> dict[str, float]:
-        """Last prices of held positions, from the broker (map back to symbols)."""
+        """Last prices of held positions, from the broker (map back to symbols).
+
+        A split-like quantity mismatch means the broker already applied a split
+        the bot has not: that symbol gets no price (no false stop) until it is
+        reconciled.
+        """
         if self._account is None:
             return {}
-        by_ticker = {p.ticker: p.price for p in self._account.positions.values()}
-        return {sym: by_ticker[pos.broker_ticker]
-                for sym, pos in self.state.positions.items()
-                if pos.broker_ticker in by_ticker and by_ticker[pos.broker_ticker] > 0}
+        out = {}
+        by_ticker = {p.ticker: p for p in self._account.positions.values()}
+        for sym, pos in self.state.positions.items():
+            bp = by_ticker.get(pos.broker_ticker)
+            if bp is None or bp.price <= 0:
+                continue
+            if pos.qty and split_ratio(bp.qty / pos.qty):
+                self._log("warning", f"broker quantity {bp.qty:g} vs {pos.qty:g}: split not "
+                          "applied yet, price ignored", sym)
+                continue
+            out[sym] = bp.price
+        return out

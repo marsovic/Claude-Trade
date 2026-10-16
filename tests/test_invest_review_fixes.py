@@ -9,7 +9,7 @@ import pytest
 
 from bot.state import StateStore
 from invest.backtest import run_backtest
-from invest.brokers.base import BrokerError, OrderRequest
+from invest.brokers.base import BrokerOutcomeUnknown, OrderRequest
 from invest.data import ET, MarketData
 from invest.engine import Engine
 from invest.execution import SimExecution
@@ -80,7 +80,7 @@ def test_death_cancels_entries_and_books_the_liquidation(tmp_path):
 
 def test_timed_out_submission_is_found_not_resent(tmp_path):
     engine, ex, broker, state, store = live_engine(tmp_path)
-    broker.raise_next = BrokerError("network error (order outcome unknown: reconciled)")
+    broker.raise_next = BrokerOutcomeUnknown("read timeout")
     broker.record_anyway = True
     ex.queue(engine, OrderRequest("AMD", "BUY", 0.3, kind="LIMIT", limit_price=101,
                                   reason="entry", day="2026-10-14", stop_pct=0.06))
