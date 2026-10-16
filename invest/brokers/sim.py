@@ -19,6 +19,7 @@ import pandas as pd
 
 from invest.brokers.base import Fill, OrderRequest
 from invest.data import ET
+from invest.risk import stop_reason
 
 
 def session_ts(day: pd.Timestamp, at: dtime) -> int:
@@ -99,7 +100,7 @@ class SimBroker:
             if bar is None or bar["low"] > pos.stop_loss:
                 continue
             price = min(bar["open"], pos.stop_loss) * (1 - slip)
-            reason = "trailing stop" if pos.stop_loss >= pos.entry_price else "stop"
+            reason = stop_reason(float(price), pos.stop_loss, pos.entry_price, slip)
             fills.append(Fill(symbol=sym, side="SELL", qty=pos.qty, price=float(price),
                               fees_eur=self._fee_eur(pos.qty, price, pos.currency, fx),
                               usd_per_eur=fx, day=str(day.date()), ts=ts, reason=reason,

@@ -188,7 +188,8 @@ def test_pyramid_add_moves_stop_to_breakeven(tmp_path):
     bars, day, hits = signal_case()
     bars = {k: v.copy() for k, v in bars.items()}
     sym = hits[0]
-    engine, state, store = make_engine(tmp_path, slots=1, slots_small_equity=1)
+    engine, state, store = make_engine(tmp_path, slots=1, slots_small_equity=1,
+                                       min_order_eur=0.0, max_weight=1.0)  # tiny test sizes
     close = bars[sym].loc[day, "close"]
     entry = close / 1.2
     state.positions[sym] = InvestPosition(

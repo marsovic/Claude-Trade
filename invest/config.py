@@ -103,7 +103,7 @@ class InvestSettings:
     exclude: list[str] = field(default_factory=list)
     min_price: float = 10.0
     min_dollar_volume: float = 50e6
-    min_history: int = 300
+    min_history: int = 260  # sessions of bars; 12-1 momentum needs 253
     atr_min_pct: float = 1.0
     atr_max_pct: float = 7.0
     max_daily_jump: float = 0.15  # lottery-stock exclusion over 21 days
@@ -129,9 +129,12 @@ class InvestSettings:
     small_equity: float = 60.0
     max_weight: float = 0.40
     max_open_risk: float = 0.12
+    max_per_theme: int = 1  # positions per theme (AI chips, software...); 0 = no limit
+    min_order_eur: float = 8.0  # smaller orders are dust that blocks a slot
     max_gross: float = 1.0  # no margin
     atr_period: int = 22
     stop_atr_mult: float = 3.0
+    trail_atr_mult: float = 0.0  # trailing distance in ATR; 0 = same as stop_atr_mult
     regime_off_stop_mult: float = 2.0
     stop_min_pct: float = 0.04
     stop_max_pct: float = 0.20
@@ -143,7 +146,7 @@ class InvestSettings:
     rebalance_weekday: int = 4  # Friday close
     dd_level1: float = 0.20
     dd_level2: float = 0.35
-    weekly_loss_pause: float = 0.15
+    weekly_loss_pause: float = 0.08  # about two stops
     pause_days: int = 5
     max_entry_gap: float = 0.03  # buy limit = close * (1 + gap)
     max_cost_r: float = 0.15  # skip trades whose round trip costs more than this x R
@@ -151,7 +154,7 @@ class InvestSettings:
     fractional: bool = True  # broker allows fractional quantities
 
     # --- 3x leveraged ETP sleeve -------------------------------------------------------
-    etp_enabled: bool = True
+    etp_enabled: bool = False  # off until it passes its own out-of-sample test
     etp_underlying: str = "QQQ"
     etp_leverage: float = 3.0
     etp_weight: float = 0.33

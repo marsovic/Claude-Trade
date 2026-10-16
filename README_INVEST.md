@@ -96,9 +96,11 @@ days, beta ≥ 1.
 - Exit before earnings below +1 R.
 - Risk-off (SPY below SMA200 for 2 closes, or VIX > 35) tightens stops to 2 ATR.
 
-**Pyramiding:** one add of 50 % at +1.5 R on a new 20-day high. The stop then moves to break-even.
+**Pyramiding:** one add of 50 % at +1.5 R on a new 20-day high, trimmed so the position never exceeds the 40 % cap. The stop then moves to break-even, and the add's own risk counts in the trade's R.
 
-**3x ETP sleeve:**
+**One bet per theme:** a hand-maintained map (`invest/universe.py`, `THEMES`: AI chips and hardware, software, financials...) allows one position per theme by default (`INV_MAX_PER_THEME`). Three slots filled with AI chips are one 100 % bet that stops out on the same day (two stops fired together in the first real backtest). Set it to 0 to disable.
+
+**3x ETP sleeve** (off by default: `INV_ETP_ENABLED=true` to turn it on; it only added exposure to the same Nasdaq bet and has not passed its own out-of-sample test):
 - At most one position, 33 % weight.
 - Only in calm uptrends: underlying above SMA50 and SMA200, realised volatility < 20 %, VIX < 22, and trend strong enough to beat the volatility drag.
 - In simulation it is synthesised from QQQ with daily reset and 0.75 %/yr costs.
@@ -107,7 +109,8 @@ days, beta ≥ 1.
 **Survival:**
 - Floor 10 €: below it the bot liquidates, writes `TOMBSTONE.json` and refuses to restart.
 - Drawdown ladder: below −20 %, 3 % risk and one slot less; below −35 %, 2 % risk, one slot and no ETP.
-- A −15 % week pauses entries for 5 sessions.
+- A −8 % week (about two stops) pauses entries for 5 sessions.
+- Orders under 8 € are refused: a 2 € "dust" position would occupy a slot for weeks.
 - Fees above 5 % of equity over 3 months pause entries.
 
 ## 3. Data and research sources (official APIs only)
@@ -217,7 +220,23 @@ python -m invest.tax --state-dir state_t212_live --year 2026
 
 This is not tax advice: check impots.gouv.fr or an adviser.
 
-## 6. Honest limitations
+## 6. Is the strategy any good? What the audits found
+
+An independent audit of the simulation engine (look-ahead, fills, exits, sizing) found **no look-ahead and no bias** in the backtest machinery: on zero-edge synthetic markets it loses about its costs, as it should. So the first real backtest (−26 % over 219 sessions while the S&P 500 gained 17 %) is a verdict on the **signals**, not on a bug. But 20–26 trades cannot validate or refute anything, and nothing in the entry rules has been changed because no change can be justified on that sample.
+
+What the audit did change: the backtest could not open a stock for its first two months (`min_history`), a "trailing stop" label hid gap losses, an add to a winner ignored the 40 % cap and its own risk, the weekly loss pause was unreachable, three slots could all be AI chips, and the leveraged ETP sleeve was on by default.
+
+How to judge the strategy properly:
+
+```bash
+# 10 years of data (Tiingo, free key, ~3 h the first time, resumable)
+INV_DATA_DIR=data_invest_tiingo python -m invest.backtest --provider tiingo --days 3000 \
+    --placebo 20 --out backtest_invest_tiingo
+```
+
+`--placebo 20` replays the same exits, sizing, costs and market filter with **random entries**, and tells you how many of those random runs the real strategy beat. About 50 % means the 7 conditions are no better than picking at random; an edge shows up as a high percentage over hundreds of trades. The report also shows the equal-weight buy & hold of the whole universe next to SPY. Pick any parameter (e.g. `INV_TRAIL_ATR_MULT=4`) on the early years and confirm it on later years you have not looked at.
+
+## 7. Honest limitations
 
 - **The edge may not exist any more.** Long-short momentum had a Sharpe of 0.12 over 2000–2025, against 0.45 since 1927. A good backtest proves nothing.
 - **Concentration.** 2–3 stocks means 35–40 % annual volatility, overnight gaps through stops, and correlated losses.

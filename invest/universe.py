@@ -42,6 +42,32 @@ CRYPTO_PROXIES = {"MSTR", "COIN", "MARA", "RIOT", "CLSK", "HUT", "BITF", "IREN",
 SIGNAL_ONLY = {"SPY", "QQQ", "SMH", "IWM"}
 
 
+# Trade themes: stocks that move together. The 3 slots must not become one bet.
+_THEME_TEXT = {
+    "ai_chips_hardware": "NVDA AVGO AMD QCOM TXN AMAT LRCX KLAC MU ADI MRVL INTC ARM ASML TSM "
+                         "ANET SMCI DELL HPE WDC STX TER ON MCHP NXPI GFS ALAB CRDO COHR LITE "
+                         "CIEN VRT CLS NBIS SNPS CDNS",
+    "ai_power": "VST CEG GEV NRG TLN ETN PWR",
+    "mega_tech": "AAPL MSFT AMZN META GOOGL TSLA NFLX ORCL",
+    "software": "ADBE CRM NOW INTU PANW CRWD FTNT ZS DDOG NET SNOW MDB TEAM WDAY ADSK PLTR APP "
+                "SHOP",
+    "consumer_internet": "UBER ABNB DASH BKNG MELI PDD SPOT RBLX TTD TTWO EA AXON RDDT",
+    "fintech": "HOOD AFRM SOFI XYZ PYPL",
+    "financials": "GS MS KKR BX APO SCHW COF JPM IBKR",
+    "industrial_defense_space": "URI CAT DE GE HWM RKLB ASTS BA LMT",
+    "materials_clean": "FSLR ENPH FCX NEM",
+    "consumer_travel": "CVNA LULU DECK ONON CELH DKNG CMG NKE RCL CCL DAL UAL ELF COST WMT",
+    "healthcare": "LLY NVO VRTX REGN ISRG DXCM MRNA HIMS",
+}
+THEMES = {k: v.split() for k, v in _THEME_TEXT.items()}
+_THEME_OF = {sym: theme for theme, syms in THEMES.items() for sym in syms}
+
+
+def theme_of(symbol: str) -> str | None:
+    """Theme of a symbol, None when unknown (such a stock is never capped)."""
+    return _THEME_OF.get(symbol.upper())
+
+
 def build_universe(custom: list[str] | None = None, exclude: list[str] | None = None
                    ) -> list[str]:
     base = list(custom) if custom else list(CURATED_US)

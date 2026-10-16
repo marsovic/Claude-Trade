@@ -10,6 +10,7 @@ prices), EUR/USD constant unless an ECB series is given.
 
     python -m invest.backtest --csv-dir data/us_daily            # offline
     python -m invest.backtest --provider massive --days 700      # downloads
+    python -m invest.backtest --provider massive --days 700 --placebo 20
 """
 
 from __future__ import annotations
@@ -57,6 +58,7 @@ class InvestBacktest:
     curve: pd.Series  # EUR equity by close
     benchmark: pd.Series  # SPY buy & hold, rebased to the initial capital
     days: int
+    equal_weight: pd.Series | None = None  # whole universe, equal weights, buy & hold
 
     def stats(self) -> dict:
         s, curve = self.state, self.curve
@@ -70,6 +72,8 @@ class InvestBacktest:
         rets = curve.pct_change().dropna()
         sharpe = float(rets.mean() / rets.std() * math.sqrt(252)) if rets.std() > 0 else 0.0
         bench_final = float(self.benchmark.iloc[-1]) if len(self.benchmark) else float("nan")
+        ew = self.equal_weight
+        ew_final = float(ew.iloc[-1]) if ew is not None and len(ew) else float("nan")
         # Each year runs from the previous year's last close (the start for year one).
         yearly = {}
         base = s.initial_capital
@@ -93,8 +97,71 @@ class InvestBacktest:
             "trading_days": self.days,
             "died": s.status == "dead",
             "benchmark_spy_final_eur": round(bench_final, 2),
+            "benchmark_equal_weight_universe_final_eur": round(ew_final, 2),
             "yearly_return_pct": yearly,
         }
+
+
+def _equal_weight(bars, universe, data, curve: pd.Series, s) -> pd.Series:
+    """Buy & hold of every stock of the universe at equal weights, in EUR."""
+    if curve.empty:
+        return pd.Series(dtype=float)
+    cols = {sym: bars[sym]["close"].reindex(curve.index).ffill() for sym in universe
+            if sym in bars}
+    closes = pd.DataFrame(cols).dropna(axis=1, how="any")
+    if closes.empty:
+        return pd.Series(dtype=float)
+    fx = pd.Series([data.fx(d) for d in curve.index], index=curve.index)
+    rebased = (closes / closes.iloc[0]).mean(axis=1) / (fx / fx.iloc[0])
+    return rebased * s.initial_capital
+
+
+def run_placebo(bars: dict[str, pd.DataFrame], s: InvestSettings, n_entries: int,
+                runs: int = 20, seed: int = 0, **kw) -> dict:
+    """Same exits, sizing, costs and regime filter, but RANDOM entries.
+
+    Entries are drawn among the eligible stocks, with about the same frequency as the
+    real run (``n_entries``). The question it answers: do the 7 conditions beat picking
+    stocks at random, on this very data? Win rate, exit mix and profit factor below 1
+    are what noise produces too; only the comparison tells.
+    """
+    universe = [u for u in build_universe(s.universe or None, s.exclude) if u in bars]
+    panel = build_panel(bars, universe, s)
+    spy = bars[s.benchmark]
+    n_days = max(len(spy.index[s.regime_sma + 60:]), 1)
+    p_entry = min(1.0, n_entries / n_days)
+    results = []
+    for i in range(runs):
+        rng = np.random.default_rng(seed + i)
+
+        def pick(day, evals, rng=rng):
+            pool = [e for e in evals.values() if e.eligible]
+            if not pool or rng.random() > p_entry:
+                return []
+            return [pool[int(rng.integers(len(pool)))]]
+
+        bt = run_backtest(bars, s, panel=panel, picker=pick, **kw)
+        st = bt.stats()
+        results.append({"return_pct": st["return_pct"], "avg_r": st["avg_r"],
+                        "trades": st["trades"], "profit_factor": st["profit_factor"]})
+    return {"runs": runs, "entry_probability_per_day": round(p_entry, 3), "results": results}
+
+
+def placebo_summary(real: dict, placebo: dict) -> dict:
+    rets = np.array([r["return_pct"] for r in placebo["results"]], dtype=float)
+    avg_r = np.array([r["avg_r"] for r in placebo["results"]], dtype=float)
+    return {
+        "runs": placebo["runs"],
+        "random_return_pct": {"median": round(float(np.median(rets)), 1),
+                              "p10": round(float(np.percentile(rets, 10)), 1),
+                              "p90": round(float(np.percentile(rets, 90)), 1)},
+        "random_avg_r_median": round(float(np.median(avg_r)), 2),
+        "real_return_pct": real["return_pct"],
+        "real_avg_r": real["avg_r"],
+        # share of random runs the real strategy beat: ~50 = no better than chance
+        "real_beats_pct_of_random_runs": round(float((rets < real["return_pct"]).mean() * 100),
+                                               0),
+    }
 
 
 def _lag(series: pd.Series | None) -> pd.Series | None:
@@ -106,8 +173,10 @@ def _lag(series: pd.Series | None) -> pd.Series | None:
 
 def run_backtest(bars: dict[str, pd.DataFrame], s: InvestSettings, start=None, end=None,
                  vix: pd.Series | None = None, vix3m: pd.Series | None = None,
-                 eurusd: pd.Series | None = None, out_dir: str | Path | None = None
-                 ) -> InvestBacktest:
+                 eurusd: pd.Series | None = None, out_dir: str | Path | None = None,
+                 panel: dict | None = None, picker=None) -> InvestBacktest:
+    """``panel`` lets repeated runs share the (slow) feature computation; ``picker`` replaces
+    the signals by another entry rule (see :func:`run_placebo`)."""
     out_dir = Path(out_dir or tempfile.mkdtemp(prefix="invest_bt_"))
     out_dir.mkdir(parents=True, exist_ok=True)
     for name in ("state.json", "decisions.jsonl", "trades.jsonl", "tax_ledger.jsonl",
@@ -126,7 +195,8 @@ def run_backtest(bars: dict[str, pd.DataFrame], s: InvestSettings, start=None, e
                       vix3m=vix3m if vix3m is not None else pd.Series(dtype=float),
                       eurusd=eurusd if eurusd is not None else pd.Series(dtype=float),
                       eurusd_fallback=s.eurusd_fallback)
-    panel = build_panel(data.bars, universe, s)
+    engine.picker = picker
+    panel = panel if panel is not None else build_panel(data.bars, universe, s)
     spy = data.bars[s.benchmark]
     days = spy.index[s.regime_sma + 60:]  # warm-up for SMA200 / 12-month momentum
     if start is not None:
@@ -146,7 +216,8 @@ def run_backtest(bars: dict[str, pd.DataFrame], s: InvestSettings, start=None, e
     bench = bench / bench.iloc[0] * s.initial_capital if len(bench) else bench
     trades = store.recent_trades(100_000)
     return InvestBacktest(state=state, trades=trades, curve=curve_s, benchmark=bench,
-                          days=len(curve_s))
+                          days=len(curve_s), equal_weight=_equal_weight(bars, universe, data,
+                                                                        curve_s, s))
 
 
 def load_csv_dir(directory: str, symbols: list[str]) -> dict[str, pd.DataFrame]:
@@ -169,13 +240,20 @@ def main(argv=None) -> int:
     p.add_argument("--days", type=int, default=700, help="calendar days of history to fetch")
     p.add_argument("--start", help="first trading day to simulate (YYYY-MM-DD)")
     p.add_argument("--no-vix", action="store_true", help="do not fetch VIX from FRED")
-    p.add_argument("--no-etp", action="store_true", help="disable the leveraged ETP sleeve")
+    p.add_argument("--etp", action="store_true",
+                   help="enable the simulated 3x ETP sleeve (off by default)")
+    p.add_argument("--no-etp", action="store_true", help="(kept for compatibility: ETP is off)")
+    p.add_argument("--placebo", type=int, default=0, metavar="N",
+                   help="also run N random-entry placebo backtests (same exits, sizing, costs) "
+                        "and say how the real result ranks among them")
     p.add_argument("--out", default="backtest_invest")
     p.add_argument("--env-file", default=".env")
     args = p.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 
     overrides = {"broker": "sim"}
+    if args.etp:
+        overrides["etp_enabled"] = True
     if args.no_etp:
         overrides["etp_enabled"] = False
     if args.provider:
@@ -206,6 +284,14 @@ def main(argv=None) -> int:
     result = run_backtest(bars, s, start=args.start, vix=vix, vix3m=vix3m, eurusd=eurusd,
                           out_dir=args.out)
     stats = result.stats()
+    placebo = None
+    if args.placebo > 0:
+        log.info("placebo: %d random-entry backtests (a few minutes)...", args.placebo)
+        raw = run_placebo(bars, s, n_entries=max(stats["trades"], 1), runs=args.placebo,
+                          start=args.start, vix=vix, vix3m=vix3m, eurusd=eurusd,
+                          out_dir=Path(args.out) / "placebo")
+        placebo = placebo_summary(stats, raw)
+        stats["placebo"] = placebo
     Path(args.out).mkdir(parents=True, exist_ok=True)
     (Path(args.out) / "summary.json").write_text(json.dumps(stats, indent=2))
     result.curve.rename("equity_eur").to_csv(Path(args.out) / "equity.csv")
@@ -214,6 +300,13 @@ def main(argv=None) -> int:
           f"{result.days} trading days ===")
     for key, value in stats.items():
         print(f"  {key:<{width}}  {value}")
+    if placebo:
+        print(f"\nPlacebo ({placebo['runs']} random-entry runs): real {placebo['real_return_pct']}%"
+              f" vs random median {placebo['random_return_pct']['median']}% (p10 "
+              f"{placebo['random_return_pct']['p10']}, p90 {placebo['random_return_pct']['p90']});"
+              f" the real strategy beat {placebo['real_beats_pct_of_random_runs']:.0f}% of them.")
+        print("Around 50% = no better than picking at random; well above 80-90% on many trades"
+              " is what a real edge looks like.")
     print(f"\nJournal, trades and tax ledger in {args.out}/")
     print("Past results, survivorship bias and simulated fills: this is not a forecast.")
     return 0

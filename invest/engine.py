@@ -17,6 +17,7 @@ Orders decided on day D execute on day D+1 (open or intraday for real brokers).
 from __future__ import annotations
 
 import logging
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 from datetime import time as dtime
 
@@ -46,6 +47,7 @@ from invest.signals import (
     symbol_features,
     synthetic_etp,
 )
+from invest.universe import theme_of
 
 log = logging.getLogger("invest")
 
@@ -57,6 +59,7 @@ class Engine:
         self.store = store
         self.exec = execution
         self.research = research
+        self.picker = None  # backtest placebo: callable(day, evals) -> candidate evals
         self.ledger = ledger
         self.fx_now = state.fx_rate or s.eurusd_fallback  # persisted across restarts
         self.day: pd.Timestamp | None = None
@@ -104,6 +107,8 @@ class Engine:
                 pos.cost_eur += cost
                 if order is not None and order.reason == "add":
                     pos.adds += 1
+                    # R is measured against everything put at risk, the add included.
+                    pos.risk_amount += gross * (order.stop_pct or 0.0)
                     pos.stop_loss = max(pos.stop_loss,
                                         breakeven_stop(pos, self.s.fees.fx_fee_pct))
                     self._log("add", f"pyramid +{f.qty:g} @ {f.price:.4g}, stop to "
@@ -298,7 +303,7 @@ class Engine:
             return None  # no bar today (halt/holiday): keep the stop working
         row = feats.loc[day]
         atr = float(row["atr"]) if not np.isnan(row["atr"]) else pos.atr
-        mult = s.regime_off_stop_mult if regime.off else s.stop_atr_mult
+        mult = s.regime_off_stop_mult if regime.off else (s.trail_atr_mult or s.stop_atr_mult)
         new_stop = chandelier_stop(pos, atr, s, mult)
         if new_stop > pos.stop_loss * 1.0005:
             old = pos.stop_loss
@@ -329,10 +334,16 @@ class Engine:
 
     def _pyramid(self, day, pos, close, equity) -> None:
         qty = pos.initial_qty * self.s.pyramid_fraction
+        rate = self._rate(pos.currency, self.fx_now)
+        room = self.s.max_weight * equity - pos.value_eur(close, self.fx_now)
+        qty = min(qty, max(room, 0.0) * rate / close)  # never above the per-name cap
         if not self.exec.fractional:
             qty = float(int(qty))
-        notional = qty * close / self._rate(pos.currency, self.fx_now)
-        if qty <= 0 or notional > self._free_cash():
+        notional = qty * close / rate
+        if qty <= 0 or notional < self.s.min_order_eur:
+            return
+        if notional > self._free_cash():
+            self._log("skip", "pyramid skipped: not enough free cash", pos.symbol)
             return
         stop_pct = max((close - pos.stop_loss) / close, self.s.stop_min_pct)
         order = OrderRequest(symbol=pos.symbol, side="BUY", qty=qty, kind="LIMIT",
@@ -355,6 +366,12 @@ class Engine:
             return []
         candidates = [e for e in evals.values() if e.signal and e.symbol not in st.positions
                       and e.symbol not in pending]
+        if self.picker is not None:  # placebo research: random entries instead of signals
+            candidates = [e for e in self.picker(day, evals) if e.symbol not in st.positions
+                          and e.symbol not in pending]
+        themes = Counter(theme_of(p.symbol) for p in held_stocks)
+        themes.update(theme_of(o["symbol"]) for o in st.pending
+                      if o["side"] == "BUY" and o["reason"] == "entry")
         bonus = {}
         if self.research is not None and s.sentiment_enabled:
             for e in sorted(candidates, key=lambda x: x.score or 0, reverse=True)[:8]:
@@ -371,6 +388,11 @@ class Engine:
             self._log("signal", f"7/7 conditions aligned, score {ev.score:+.2f}"
                       + (" + insider buying" if ev.symbol in bonus else ""), ev.symbol,
                       {"checks": ev.checks, "values": ev.values})
+            theme = theme_of(ev.symbol)
+            if s.max_per_theme and theme and themes[theme] >= s.max_per_theme:
+                self._log("skip", f"already {themes[theme]} position(s) in the {theme} theme: "
+                          "the slots must not become one bet", ev.symbol)
+                continue
             veto = self._veto(day, ev, earnings)
             if veto:
                 self._log("veto", veto, ev.symbol)
@@ -398,6 +420,7 @@ class Engine:
             free -= 1
             cash -= sized.notional_eur
             open_risk += sized.risk_eur
+            themes[theme] += 1
             entered.append(ev.symbol)
         return entered
 

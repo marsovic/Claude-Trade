@@ -36,6 +36,7 @@ from invest.brokers.base import (
 from invest.brokers.sim import SimBroker
 from invest.data import ET
 from invest.markets import split_ratio
+from invest.risk import stop_reason
 
 log = logging.getLogger("invest")
 
@@ -450,7 +451,7 @@ class LiveExecution:
         reason = o.reason
         if o.kind == "STOP":
             pos = self.state.positions.get(o.symbol)
-            reason = "trailing stop" if pos is not None and pos.stop_loss >= pos.entry_price \
+            reason = stop_reason(price, pos.stop_loss, pos.entry_price) if pos is not None \
                 else "stop"
         return Fill(symbol=o.symbol, side=o.side, qty=qty, price=price, fees_eur=fees,
                     usd_per_eur=fx, day=str(day), ts=ts, reason=reason, order=o.to_dict(),

@@ -83,8 +83,8 @@ def size_position(price: float, atr: float, equity: float, cash: float, open_ris
     if qty <= 0:
         return None, "quantity rounds to zero"
     notional_eur = qty * price / rate
-    if notional_eur < 1.0:
-        return None, "order below 1 EUR minimum"
+    if notional_eur < s.min_order_eur:
+        return None, f"order {notional_eur:.2f} EUR below the {s.min_order_eur:g} EUR minimum"
     risk_eur = notional_eur * stop_pct
     round_trip = (fees.cost(qty, price, foreign) * 2) / rate
     if risk_eur > 0 and round_trip / risk_eur > s.max_cost_r:
@@ -103,6 +103,15 @@ def chandelier_stop(pos: InvestPosition, atr: float, s, mult: float | None = Non
     # Same floor as the initial stop: never trail closer than stop_min_pct.
     distance = max(mult * atr, s.stop_min_pct * pos.highest)
     return max(pos.stop_loss, pos.highest - distance)
+
+
+def stop_reason(fill: float, stop: float, entry: float, slip: float = 0.0) -> str:
+    """Name a stop exit by its outcome, not by where the stop stood."""
+    if fill >= entry:
+        return "trailing stop"
+    if fill < stop * (1 - slip) * 0.995:
+        return "stop (gap)"  # the price jumped through the stop
+    return "stop"
 
 
 def pyramid_ok(pos: InvestPosition, close: float, new_high: bool, pct_rank: float | None,
