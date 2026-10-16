@@ -151,3 +151,22 @@ def test_yearly_returns_start_from_the_previous_close():
 def test_vix_is_lagged_one_session():
     d = pd.to_datetime(["2026-10-13", "2026-10-14"])
     assert _lag(pd.Series([10.0, 20.0], index=d)).to_dict() == {d[1]: 10.0}
+
+
+def test_history_download_is_saved_symbol_by_symbol(tmp_path):
+    """An interrupted first download keeps what it has and resumes from there."""
+    class Flaky(FakeProvider):
+        def history(self, symbol, start, end):
+            if symbol == "NVDA":
+                raise KeyboardInterrupt  # Ctrl+C in the middle of the download
+            return super().history(symbol, start, end)
+
+    store = BarStore(tmp_path, Flaky(), history_days=60)
+    with pytest.raises(KeyboardInterrupt):
+        store.update(["AMD", "MSFT", "NVDA", "TSLA"], date(2026, 10, 12))
+    assert (tmp_path / "bars" / "AMD.csv").exists() and (tmp_path / "bars" / "MSFT.csv").exists()
+    assert not (tmp_path / "bars" / "NVDA.csv").exists()
+    resume = FakeProvider()
+    BarStore(tmp_path, resume, history_days=60).update(["AMD", "MSFT", "NVDA", "TSLA"],
+                                                       date(2026, 10, 12))
+    assert resume.history_calls == ["NVDA", "TSLA"]  # AMD and MSFT are not downloaded again

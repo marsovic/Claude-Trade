@@ -73,6 +73,7 @@ class RateLimiter:
 class BarProvider:
     name = "base"
     supports_grouped = False
+    batch_size = 1  # symbols per history_many() call (the cache is saved after each batch)
 
     def history(self, symbol: str, start: date, end: date) -> pd.DataFrame:
         raise NotImplementedError
@@ -142,6 +143,7 @@ class AlpacaDataProvider(BarProvider):
     """https://data.alpaca.markets - free with any Alpaca account (paper too)."""
 
     name = "alpaca"
+    batch_size = 50
     BASE = "https://data.alpaca.markets/v2/stocks/bars"
 
     def __init__(self, api_key: str, api_secret: str, session: requests.Session | None = None,
@@ -310,10 +312,20 @@ class BarStore:
         need_full = [s for s, f in frames.items() if f.empty or f.index[0].date() > start_full
                      + timedelta(days=10)]
         if need_full:
-            log.info("downloading %d symbols of history from %s", len(need_full),
+            log.info("downloading %d symbols of history from %s (saved as it goes: an "
+                     "interrupted run resumes where it stopped)", len(need_full),
                      self.provider.name)
-            for sym, df in self.provider.history_many(need_full, start_full, end).items():
-                frames[sym] = normalise(pd.concat([frames.get(sym, empty_frame()), df]))
+            step = max(1, self.provider.batch_size)
+            for i in range(0, len(need_full), step):
+                chunk = need_full[i:i + step]
+                for sym, df in self.provider.history_many(chunk, start_full, end).items():
+                    frames[sym] = normalise(pd.concat([frames.get(sym, empty_frame()), df]))
+                    if not frames[sym].empty:
+                        self.save(sym, frames[sym])
+                done = min(i + step, len(need_full))
+                if done == len(need_full) or done % 10 < step:
+                    log.info("history: %d/%d symbols downloaded (last: %s)", done,
+                             len(need_full), chunk[-1])
         stale = [s for s, f in frames.items() if s not in need_full and not f.empty
                  and f.index[-1].date() < end]
         if stale:
