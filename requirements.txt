@@ -3,3 +3,4 @@ pandas>=2.1
 numpy>=1.26
 python-dotenv>=1.0
 flask>=3.0
+cryptography>=42  # Revolut X Ed25519 signatures

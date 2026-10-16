@@ -35,6 +35,7 @@ class BotState:
     balance: float
     started_at: int
     status: str = "running"  # running | stopped | dead
+    venue: str = "binance"  # binance | revolutx
     equity: float = 0.0
     peak_equity: float = 0.0
     positions: dict[str, Position] = field(default_factory=dict)
@@ -58,13 +59,15 @@ class BotState:
     income_cursor: int = 0
     income_total: float = 0.0
     income_seen: list[int] = field(default_factory=list)
+    # Revolut X: entries sent but not confirmed yet, by client_order_id.
+    pending_entries: dict[str, dict] = field(default_factory=dict)
 
     @classmethod
-    def fresh(cls, mode: str, initial_capital: float) -> BotState:
+    def fresh(cls, mode: str, initial_capital: float, venue: str = "binance") -> BotState:
         t = now_ms()
         return cls(mode=mode, initial_capital=initial_capital, balance=initial_capital,
                    started_at=t, equity=initial_capital, peak_equity=initial_capital,
-                   income_cursor=t)
+                   income_cursor=t, venue=venue)
 
     def used_margin(self) -> float:
         return sum(p.margin for p in self.positions.values())

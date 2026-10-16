@@ -53,6 +53,12 @@ class Position:
     breakeven_done: bool = False
     sl_algo_id: int | None = None
     tp_algo_id: int | None = None
+    # Revolut X (spot): resting take-profit and the quote amount spent, fees included.
+    tp_order_id: str | None = None
+    tp_client_id: str | None = None
+    cost: float = 0.0
+    exit_order_ids: list[str] = field(default_factory=list)  # every order that sold coins
+    exit_client_ids: list[str] = field(default_factory=list)  # sells whose reply was lost
     sentiment: float | None = None
     signal: dict = field(default_factory=dict)
 

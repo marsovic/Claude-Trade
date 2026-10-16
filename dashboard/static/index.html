@@ -291,8 +291,8 @@ function render(data) {
     death.style.display = "block";
     death.replaceChildren(
       el("strong", null, "Capital lost — the bot stopped forever. "),
-      el("span", null, `Died ${datetime(tomb.died_at)} with ${fmt(tomb.equity)} USDT ` +
-         `after ${tomb.trades} trades (floor ${fmt(tomb.survival_floor)} USDT).`));
+      el("span", null, `Died ${datetime(tomb.died_at)} with ${fmt(tomb.equity)} ${CUR} ` +
+         `after ${tomb.trades} trades (floor ${fmt(tomb.survival_floor)} ${CUR}).`));
   } else death.style.display = "none";
 
   // KPIs
@@ -353,7 +353,9 @@ function renderSentiment(s) {
   const universe = new Set(s.universe || []);
   $("trending").replaceChildren(...(m.trending || []).map((sym) => {
     const c = el("span", "chip", sym);
-    if (universe.has(sym) || universe.has(sym + "USDT")) c.style.outline = "1px solid var(--accent)";
+    const quote = (s.settings || {}).quote_asset || "USDT";
+    if (universe.has(sym) || universe.has(sym + quote) || universe.has(sym + "-" + quote))
+      c.style.outline = "1px solid var(--accent)";
     return c;
   }));
   if (!(m.trending || []).length) $("trending").replaceChildren(el("span", "muted", "—"));

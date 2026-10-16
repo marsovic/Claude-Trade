@@ -13,6 +13,7 @@ Examples::
 
     python -m bot.backtest --top 10 --days 30
     python -m bot.backtest --symbols BTCUSDT,ETHUSDT,SOLUSDT --days 90 --fng
+    python -m bot.backtest --exchange revolutx --symbols BTC-EUR,ETH-EUR --days 30
     python -m bot.backtest --csv-dir data/my_klines --interval 1h
 """
 
@@ -40,6 +41,7 @@ if __package__ in (None, ""):
 from bot.binance_client import BinanceFuturesClient, SymbolInfo
 from bot.config import Settings
 from bot.indicators import add_indicators, klines_to_frame
+from bot.revolutx_client import STABLECOINS, RevolutXClient
 from bot.risk import (
     ClosedTrade,
     Position,
@@ -76,7 +78,7 @@ def download_klines(client: BinanceFuturesClient, symbol: str, interval: str,
             break
         rows.extend(batch)
         last_open = int(batch[-1][0])
-        if last_open + 1 <= cursor or len(batch) < 1500:
+        if last_open + 1 <= cursor:
             break
         cursor = last_open + 1
         time.sleep(0.2)  # be gentle with the API
@@ -284,6 +286,9 @@ def run_backtest(frames: dict[str, pd.DataFrame], s: Settings,
             d = data[symbol]
             side = d["signal"][i]
             signals += 1
+            if s.long_only and side != LONG:
+                skip("short signal (spot venue)")
+                continue
             if symbol in positions or any(o["symbol"] == symbol for o in pending):
                 skip("already in position")
                 continue
@@ -351,16 +356,18 @@ def main(argv=None) -> int:
     p.add_argument("--end", help="YYYY-MM-DD (default: now)")
     p.add_argument("--interval", help="kline interval (default: INTERVAL setting)")
     p.add_argument("--csv-dir", help="offline mode: read <SYMBOL>.csv files from here")
+    p.add_argument("--exchange", choices=["binance", "revolutx"],
+                   help="venue rules and data (default: EXCHANGE setting)")
     p.add_argument("--fng", action="store_true", help="apply historical Fear & Greed veto")
     p.add_argument("--out", default="backtest_results")
     p.add_argument("--env-file", default=".env")
     args = p.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 
-    overrides = {"mode": "paper"}
+    overrides = {"mode": "paper", "exchange": args.exchange}
     if args.interval:
         overrides["interval"] = args.interval
-    s = Settings.from_env(args.env_file, **overrides)
+    s = Settings.from_env(args.env_file, require_credentials=not args.csv_dir, **overrides)
 
     frames: dict[str, pd.DataFrame] = {}
     infos: dict[str, SymbolInfo] = {}
@@ -368,14 +375,16 @@ def main(argv=None) -> int:
         for path in sorted(Path(args.csv_dir).glob("*.csv")):
             frames[path.stem.upper()] = load_csv(path)
     else:
-        client = BinanceFuturesClient(s.base_url)
+        client = (RevolutXClient(s.revx_api_key, s.revx_private_key_path, s.revx_base_url)
+                  if s.exchange == "revolutx" else BinanceFuturesClient(s.base_url))
         infos = client.symbol_infos()
         if args.symbols:
             symbols = [x.strip().upper() for x in args.symbols.split(",") if x.strip()]
         else:
             tickers = [t for t in client.ticker_24h()
                        if t["symbol"] in infos and t["symbol"] not in s.exclude_symbols
-                       and infos[t["symbol"]].quote_asset == s.quote_asset]
+                       and infos[t["symbol"]].quote_asset == s.quote_asset
+                       and infos[t["symbol"]].base_asset not in STABLECOINS]
             tickers.sort(key=lambda t: float(t["quoteVolume"]), reverse=True)
             symbols = [t["symbol"] for t in tickers[: args.top]]
         end = _parse_day(args.end) if args.end else int(time.time() * 1000)

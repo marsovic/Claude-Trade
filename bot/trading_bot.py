@@ -3,6 +3,8 @@
 Binance USDⓈ-M futures, the 40 most liquid perpetual pairs, 7 aligned
 indicators, volatility-adapted leverage (max x5), 2 % risk per trade,
 sentiment veto. It starts with 50 USDT; if it loses them it stops forever.
+With ``EXCHANGE=revolutx`` it trades Revolut X spot instead: the most liquid
+EUR pairs, long only, no leverage.
 
 Usage::
 
@@ -10,6 +12,7 @@ Usage::
     python -m bot.trading_bot --once          # one cycle then exit
     python -m bot.trading_bot --mode testnet  # Binance futures testnet
     python -m bot.trading_bot --mode live --i-understand-the-risks
+    python -m bot.trading_bot --exchange revolutx          # Revolut X, paper
 """
 
 from __future__ import annotations
@@ -32,24 +35,31 @@ from bot.binance_client import BinanceAPIError, BinanceFuturesClient, SymbolInfo
 from bot.broker import BinanceBroker, PaperBroker
 from bot.config import LIVE_CONFIRMATION, ConfigError, Settings
 from bot.indicators import add_indicators, klines_to_frame
+from bot.revolutx_broker import RevolutXBroker
+from bot.revolutx_client import STABLECOINS, RevolutXClient
 from bot.risk import ClosedTrade, plan_trade
 from bot.sentiment import SentimentEngine
 from bot.state import BotState, StateStore
-from bot.strategy import Evaluation, evaluate_last
+from bot.strategy import LONG, Evaluation, evaluate_last
 
 log = logging.getLogger("bot")
 
 EXIT_DEAD = 2
 
 
+def make_client(s: Settings):
+    if s.exchange == "revolutx":
+        return RevolutXClient(s.revx_api_key, s.revx_private_key_path, s.revx_base_url)
+    return BinanceFuturesClient(s.base_url, s.binance_api_key, s.binance_api_secret,
+                                spot_base_url=s.spot_base_url)
+
+
 class TradingBot:
-    def __init__(self, settings: Settings, client: BinanceFuturesClient | None = None,
+    def __init__(self, settings: Settings, client=None,
                  sentiment: SentimentEngine | None = None, clock=time.time):
         self.s = settings
         self.clock = clock
-        self.client = client or BinanceFuturesClient(
-            settings.base_url, settings.binance_api_key, settings.binance_api_secret,
-            spot_base_url=settings.spot_base_url)
+        self.client = client or make_client(settings)
         self.sentiment = sentiment or SentimentEngine(settings, clock=clock)
         self.store = StateStore(settings.state_dir)
         self.state: BotState | None = None
@@ -68,15 +78,16 @@ class TradingBot:
             raise BotIsDead(tomb)
         state = self.store.load()
         if state is None:
-            state = BotState.fresh(self.s.mode, self.s.initial_capital)
+            state = BotState.fresh(self.s.mode, self.s.initial_capital, self.s.exchange)
             state.started_at = state.income_cursor = self.now_ms()
             self.store.log_decision(
-                "start", f"new life: {self.s.initial_capital:.2f} USDT in {self.s.mode} mode",
-                ts=state.started_at)
-        elif state.mode != self.s.mode:
+                "start", f"new life: {self.s.initial_capital:.2f} {self.s.quote_asset} on "
+                f"{self.s.exchange} in {self.s.mode} mode", ts=state.started_at)
+        elif state.mode != self.s.mode or state.venue != self.s.exchange:
             raise ConfigError(
-                f"{self.store.dir} holds a {state.mode!r} state but MODE={self.s.mode!r}. "
-                "Use a different STATE_DIR for each mode.")
+                f"{self.store.dir} holds a {state.venue}/{state.mode} state but EXCHANGE="
+                f"{self.s.exchange}, MODE={self.s.mode}. Use a different STATE_DIR for each "
+                "exchange and mode.")
         else:
             self.store.log_decision("start", f"resumed (v{__version__}), "
                                     f"{len(state.positions)} open position(s)")
@@ -87,6 +98,8 @@ class TradingBot:
         self.refresh_universe(force=True)
         if self.s.is_paper:
             self.broker = PaperBroker(self.s, state, self.store)
+        elif self.s.exchange == "revolutx":
+            self.broker = RevolutXBroker(self.s, state, self.store, self.client, self.symbols)
         else:
             self.broker = BinanceBroker(self.s, state, self.store, self.client, self.symbols)
             for warning in self.broker.preflight():
@@ -98,12 +111,14 @@ class TradingBot:
         if not force and self.clock() - self.universe_at < self.s.universe_refresh_minutes * 60:
             return
         self.symbols = self.client.symbol_infos()
-        if isinstance(self.broker, BinanceBroker):
+        if hasattr(self.broker, "symbols"):
             self.broker.symbols = self.symbols
         tickers = self.client.ticker_24h()
         rows = [t for t in tickers
                 if t["symbol"] in self.symbols
                 and self.symbols[t["symbol"]].quote_asset == self.s.quote_asset
+                and self.symbols[t["symbol"]].base_asset not in STABLECOINS
+                and float(t.get("quoteVolume", 0)) >= self.s.min_quote_volume
                 and t["symbol"] not in self.s.exclude_symbols]
         rows.sort(key=lambda t: float(t.get("quoteVolume", 0)), reverse=True)
         universe = [t["symbol"] for t in rows[: self.s.universe_size]]
@@ -116,8 +131,9 @@ class TradingBot:
     # ============================================================ main loop
     def run_forever(self) -> int:
         self.setup()
-        log.info("bot started in %s mode, equity %.2f USDT, universe %d pairs",
-                 self.s.mode, self.state.balance, len(self.state.universe))
+        log.info("bot started on %s in %s mode, equity %.2f %s, universe %d pairs",
+                 self.s.exchange, self.s.mode, self.state.balance, self.s.quote_asset,
+                 len(self.state.universe))
         while self.running:
             try:
                 alive = self.cycle()
@@ -189,7 +205,8 @@ class TradingBot:
             trade.closed_at + self.s.cooldown_bars * self.s.interval_seconds * 1000)
         self.store.log_trade(trade)
         self.store.log_decision(
-            "close", f"{trade.reason}: {trade.pnl:+.2f} USDT ({trade.r_multiple:+.2f}R)",
+            "close", f"{trade.reason}: {trade.pnl:+.2f} {self.s.quote_asset} "
+            f"({trade.r_multiple:+.2f}R)",
             trade.symbol, trade.side, trade.to_dict(), ts=trade.closed_at)
         log.info("CLOSE %s %s %s pnl=%+.2f", trade.symbol, trade.side, trade.reason, trade.pnl)
 
@@ -227,13 +244,17 @@ class TradingBot:
             "survival_floor": self.s.survival_floor,
             "trades": st.stats["trades"],
             "mode": st.mode,
+            "venue": st.venue,
+            "currency": self.s.quote_asset,
         }
         self.store.write_tombstone(info)
-        self.store.log_decision("death", f"capital lost ({equity:.2f} USDT <= floor "
+        self.store.log_decision("death", f"capital lost ({equity:.2f} {self.s.quote_asset} "
+                                f"<= floor "
                                 f"{self.s.survival_floor:.2f}). The bot stops forever.",
                                 data=info, ts=now)
         self.store.save(st)
-        log.critical("CAPITAL LOST - equity %.2f USDT. The bot stops permanently.", equity)
+        log.critical("CAPITAL LOST - equity %.2f %s. The bot stops permanently.", equity,
+                     self.s.quote_asset)
         return False
 
     # =============================================================== scan
@@ -267,6 +288,12 @@ class TradingBot:
 
         candidates = sorted((e for e in evaluations if e.signal),
                             key=lambda e: e.strength, reverse=True)
+        if self.s.long_only:
+            for e in candidates:
+                if e.signal != LONG:
+                    self.store.log_decision("skip", "SHORT signal ignored: spot venue, no "
+                                            "short selling", e.symbol, e.signal, ts=now)
+            candidates = [e for e in candidates if e.signal == LONG]
         market = self.sentiment.market_snapshot()
         self.state.sentiment = market
         self.state.last_scan = {
@@ -275,6 +302,7 @@ class TradingBot:
             "evaluated": len(evaluations),
             "errors": errors,
             "signals": [e.symbol for e in candidates],
+            "long_only": self.s.long_only,
             "evaluations": sorted(
                 (e.to_dict() for e in evaluations),
                 key=lambda d: max(d["long_score"], d["short_score"]), reverse=True),
@@ -301,9 +329,12 @@ class TradingBot:
             return skip("bot not running")
         if ev.symbol in st.positions:
             return skip("already in a position on this pair")
+        pending = [p["plan"]["symbol"] for p in st.pending_entries.values()]
+        if ev.symbol in pending:
+            return skip("previous entry still awaiting confirmation")
         if st.cooldowns.get(ev.symbol, 0) > now:
             return skip("cooldown after a recent trade")
-        if len(st.positions) >= self.s.max_open_positions:
+        if len(st.positions) + len(pending) >= self.s.max_open_positions:
             return skip(f"max {self.s.max_open_positions} open positions reached")
         if st.daily_halt:
             return skip("daily loss limit reached")
@@ -336,7 +367,7 @@ class TradingBot:
             "open",
             f"{pos.side} x{pos.leverage} qty {pos.qty:g} @ {pos.entry_price:.6g} "
             f"SL {pos.stop_loss:.6g} TP {pos.take_profit:.6g} "
-            f"risk {pos.risk_amount:.2f} USDT ({why})",
+            f"risk {pos.risk_amount:.2f} {self.s.quote_asset} ({why})",
             ev.symbol, ev.signal, pos.to_dict(), ts=now)
         log.info("OPEN %s %s x%d qty=%g entry=%.6g sl=%.6g tp=%.6g", pos.symbol, pos.side,
                  pos.leverage, pos.qty, pos.entry_price, pos.stop_loss, pos.take_profit)
@@ -365,7 +396,9 @@ def setup_logging(state_dir: str, verbose: bool = False) -> None:
 
 
 def parse_args(argv=None):
-    p = argparse.ArgumentParser(description="Survival trading bot (Binance futures)")
+    p = argparse.ArgumentParser(description="Survival trading bot (Binance futures or "
+                                "Revolut X spot)")
+    p.add_argument("--exchange", choices=["binance", "revolutx"], help="overrides EXCHANGE")
     p.add_argument("--mode", choices=["paper", "testnet", "live"], help="overrides MODE")
     p.add_argument("--state-dir", help="overrides STATE_DIR")
     p.add_argument("--once", action="store_true", help="run a single cycle and exit")
@@ -378,7 +411,7 @@ def parse_args(argv=None):
 
 def main(argv=None) -> int:
     args = parse_args(argv)
-    overrides = {"mode": args.mode, "state_dir": args.state_dir}
+    overrides = {"mode": args.mode, "state_dir": args.state_dir, "exchange": args.exchange}
     if args.i_understand_the_risks:
         overrides["live_trading"] = LIVE_CONFIRMATION
     try:
@@ -396,17 +429,18 @@ def main(argv=None) -> int:
     signal.signal(signal.SIGINT, stop)
     signal.signal(signal.SIGTERM, stop)
     if settings.mode == "live":
-        log.warning("LIVE MODE: real money at risk. Capital %.2f USDT, risk %.1f%%/trade, "
-                    "max leverage x%d.", settings.initial_capital,
-                    settings.risk_per_trade * 100, settings.max_leverage)
+        log.warning("LIVE MODE on %s: real money at risk. Capital %.2f %s, risk %.1f%%/trade, "
+                    "max leverage x%d.", settings.exchange, settings.initial_capital,
+                    settings.quote_asset, settings.risk_per_trade * 100, settings.max_leverage)
     try:
         return bot.run_once() if args.once else bot.run_forever()
     except BotIsDead as dead:
         t = dead.tombstone
-        log.critical("This bot lost its capital on %s (equity %.2f USDT after %s trades). "
+        log.critical("This bot lost its capital on %s (equity %.2f %s after %s trades). "
                      "It will never trade again. To start a brand new life, archive or "
                      "delete the %s directory yourself.", t.get("died_at_iso"),
-                     t.get("equity", 0), t.get("trades"), settings.state_dir)
+                     t.get("equity", 0), settings.quote_asset, t.get("trades"),
+                     settings.state_dir)
         return EXIT_DEAD
     except ConfigError as exc:
         log.error("%s", exc)

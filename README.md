@@ -14,6 +14,9 @@ dashboard** shows every decision it takes.
 > **New:** an investment version for **stocks & ETPs (no crypto)**, starting with
 > 100 €, with the list of platforms that accept bots in France →
 > [README_INVEST.md](README_INVEST.md).
+>
+> **New:** the crypto bot also runs on **Revolut X** (spot, EUR pairs, long only,
+> no leverage) → [Revolut X (spot, EUR)](#revolut-x-spot-eur).
 
 > [!WARNING]
 > **This is not financial advice.** It is a learning project, still imperfect.
@@ -33,6 +36,7 @@ dashboard** shows every decision it takes.
 - [Project layout](#project-layout)
 - [Installation](#installation)
 - [Usage](#usage) — paper trading, dashboard, backtests, testnet, live
+- [Revolut X (spot, EUR)](#revolut-x-spot-eur)
 - [Configuration](#configuration)
 - [State files](#state-files)
 - [Running 24/7](#running-247)
@@ -153,6 +157,8 @@ which keeps API usage tiny.
 │   ├── sentiment.py       # Fear & Greed, CoinGecko, CryptoPanic, X
 │   ├── broker.py          # PaperBroker (simulation) and BinanceBroker (real orders)
 │   ├── binance_client.py  # Minimal signed REST client (incl. Algo Order API)
+│   ├── revolutx_client.py # Revolut X REST client (Ed25519 signatures)
+│   ├── revolutx_broker.py # Revolut X spot orders: IOC entries, resting take-profit
 │   ├── state.py           # state.json, decision journal, trades, tombstone
 │   ├── backtest.py        # Backtester with the same rules
 │   └── config.py          # Settings from environment / .env
@@ -263,6 +269,99 @@ one-way mode. Every position gets a `STOP_MARKET` and a `TAKE_PROFIT_MARKET`
 Order API, so it stays protected even if the bot crashes. If the stop cannot be
 placed, the position is closed immediately.
 
+## Revolut X (spot, EUR)
+
+`EXCHANGE=revolutx` runs the same bot on [Revolut X](https://exchange.revolut.com),
+Revolut's crypto exchange, through its official REST API. It is a **spot**
+exchange, so the rules change:
+
+| | Binance futures | Revolut X spot |
+|---|---|---|
+| Direction | long and short | **long only** (SHORT signals are logged and skipped) |
+| Leverage | x1 to x5 | **x1** (no leverage, no liquidation) |
+| Universe | 40 most liquid USDT perpetuals | liquid **EUR** pairs (≥ 50 000 €/24 h, about 25), stablecoins excluded |
+| Fees | 0.05 % taker | 0.09 % taker, 0 % maker |
+| Stop-loss | on the exchange (Algo Order API) | **watched by the bot** every `POLL_SECONDS` (the API has no stop orders) |
+| Take-profit | on the exchange | **on the exchange**: GTC limit sell (maker, 0 % fee) |
+| Testnet | yes | no: use paper mode |
+
+The 7 conditions, the 2 % risk sizing, break-even, trailing stop, daily loss
+limit, sentiment veto and the survival rule (50 € → stops forever if lost) are
+unchanged.
+
+### Keys
+
+Revolut X signs every request with an **Ed25519** key pair. Candles and tickers
+also need the key, so **paper mode needs it too**.
+
+```bash
+openssl genpkey -algorithm ed25519 -out revx_private.pem
+openssl pkey -in revx_private.pem -pubout -out revx_public.pem
+chmod 600 revx_private.pem          # the bot refuses a key other users can read
+```
+
+Register `revx_public.pem` at **exchange.revolut.com → Profile → API Keys**,
+create the API key (whitelist your server's IP), then in `.env`:
+
+```bash
+EXCHANGE=revolutx
+REVX_API_KEY=<the 64-character key>
+REVX_PRIVATE_KEY_PATH=/path/to/revx_private.pem
+STATE_DIR=state_revx_paper
+```
+
+If these two variables are empty, the bot reads the configuration of the
+official `revx` CLI / Revolut X MCP server (`~/.config/revolut-x/config.json`
+and `private.pem`, or `REVOLUTX_CONFIG_DIR`). Revolut X API keys cannot
+withdraw: the API has no withdrawal endpoint.
+
+### Run
+
+```bash
+python -m bot.trading_bot --exchange revolutx                    # paper
+python -m bot.trading_bot --exchange revolutx --mode live \
+    --state-dir state_revx_live --i-understand-the-risks           # real money
+python -m bot.backtest --exchange revolutx --symbols BTC-EUR,ETH-EUR,SOL-EUR --days 30
+```
+
+Before trading real money the bot checks the key (a `401` usually means the
+IP is not whitelisted) and **refuses to start on an empty account**. It never
+sells more than the coins it bought itself: coins you already hold on Revolut X
+are left alone, and so are orders you placed by hand.
+
+How orders are sent:
+
+- **Entry**: IOC limit buy capped at `ask × (1 + REVX_ENTRY_SLIPPAGE)` (0.3 %).
+  Not filled → no trade.
+- **Take-profit**: GTC limit sell resting on the exchange; it executes even when
+  the bot is offline.
+- **Stop-loss / trailing stop**: the bot compares the **bid** with the stop at
+  every poll and sells at market when it is touched (the take-profit is
+  cancelled first so the coins are free). **While the bot is stopped, nothing
+  watches the stop**: run it under systemd / Docker with automatic restart.
+- **Lost replies**: every order has a `client_order_id`, saved before sending,
+  that the exchange refuses twice. A buy whose reply is lost is looked up by
+  that id on the next cycles (never sent again). A sell is capped by the coins
+  really available, so it can never be doubled.
+
+### Monitoring with the Revolut X connector
+
+The Revolut X connector for Claude (MCP) is **read-only**: balances, open and
+past orders, fills, candles, tickers. It cannot place orders, so the bot talks
+to the REST API itself — but you can ask Claude, through the connector, to check
+what the bot did (open orders, fills, balances) and compare it with the
+dashboard.
+
+### What the data says
+
+Backtest on **real Revolut X 15-minute candles** (10 most traded EUR pairs, 17
+Sep → 16 Oct 2026, downloaded through the connector), default settings, long
+only: **−22 %** (198 trades, 26 % winners, profit factor 0.52, 5 € of fees on
+50 €), in a month when simply holding those coins returned +3 % to +103 %. Wider
+stops (2.5–3.5 ATR) or 1-hour candles lost less (−5 % to −12 %) but **every
+variant tested lost money**. One month proves little either way, but do not go
+live on this strategy without a long paper-trading period.
+
 ## Configuration
 
 All settings live in `bot/config.py` and can be overridden by environment
@@ -348,6 +447,9 @@ documented example.
 - Exchange APIs change (e.g. Binance moved conditional orders to the Algo Order
   API in December 2025). Re-test on testnet after any upgrade.
 - One-way mode only; one position per pair; USDT-margined perpetuals only.
+- Revolut X: the stop-loss lives in the bot, not on the exchange (the REST API
+  has no stop orders). A crash or a network outage leaves positions without a
+  stop until the bot is back; the take-profit keeps resting on the exchange.
 
 Feedback, issues and contributions are welcome: test it, break it, improve it.
 
@@ -368,6 +470,14 @@ il démarre avec **50 USDT**, et s'il les perd, **il s'arrête définitivement**
 - Modes **paper** (par défaut), **testnet** et **live** (verrouillé, refuse les
   clés API autorisant les retraits).
 - **Backtester** avec exactement les mêmes règles.
+
+**Revolut X** (`EXCHANGE=revolutx`) : même bot en **spot**, paires en **euros**,
+**achat uniquement** (pas de vente à découvert), **sans levier**. Le
+take-profit est un ordre limite posé chez Revolut ; le stop-loss est surveillé
+par le bot toutes les 20 s (l'API n'a pas d'ordre stop), donc le bot doit
+tourner en continu. Clé Ed25519 obligatoire, même en simulation. Sur les vraies
+bougies Revolut X du dernier mois, la stratégie a **perdu 22 %** alors que le
+marché montait : simulation longue obligatoire avant tout argent réel.
 
 Avant toute utilisation : configurez vos propres clés API **sans droit de
 retrait**, lancez des backtests, faites tourner le bot en simulation pendant
