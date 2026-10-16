@@ -41,6 +41,10 @@ class DataError(RuntimeError):
     pass
 
 
+class DataNotReady(DataError):
+    """The provider has not published this day yet (today, before its end-of-day run)."""
+
+
 def empty_frame() -> pd.DataFrame:
     return pd.DataFrame(columns=COLUMNS, index=pd.DatetimeIndex([], name="date"), dtype=float)
 
@@ -109,6 +113,8 @@ class MassiveProvider(BarProvider):
             if resp.status_code == 429 or "maximum requests" in text.lower():
                 self.sleep(15 * (attempt + 1))
                 continue
+            if "before end of day" in text.lower():
+                raise DataNotReady(f"Massive: today's data is not published yet ({text})")
             if resp.status_code == 403:
                 raise DataError(f"Massive: endpoint not in your plan ({text})")
             if resp.status_code >= 400:
@@ -341,12 +347,12 @@ class BarStore:
                 days = [oldest + timedelta(days=i) for i in range(1, (end - oldest).days + 1)]
                 days = [d for d in days if d.weekday() < 5]
                 for check in sorted({last[sym].date() for sym in recent}):
-                    rows = self.provider.grouped(check) or {}
+                    rows = self._grouped(check)
                     for sym in recent:
                         if last[sym].date() == check and sym in rows:
                             self._compare(sym, frames[sym], rows[sym]["close"], mismatch)
                 for day in days:
-                    rows = self.provider.grouped(day) or {}
+                    rows = self._grouped(day)
                     for sym in recent:
                         if sym in rows and sym not in mismatch \
                                 and frames[sym].index[-1].date() < day:
@@ -383,6 +389,15 @@ class BarStore:
             if not frames[sym].empty:
                 self.save(sym, frames[sym])
         return frames
+
+    def _grouped(self, day: date) -> dict[str, dict]:
+        """One day for the whole market; a day not published yet counts as empty."""
+        try:
+            return self.provider.grouped(day) or {}
+        except DataNotReady:
+            log.info("%s is not published by %s yet: it will be fetched next time", day,
+                     self.provider.name)
+            return {}
 
     def _remember_splits(self, found: dict[str, tuple[str, float]],
                          end: date) -> dict[str, tuple[str, float]]:

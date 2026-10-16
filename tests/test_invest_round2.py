@@ -170,3 +170,20 @@ def test_history_download_is_saved_symbol_by_symbol(tmp_path):
     BarStore(tmp_path, resume, history_days=60).update(["AMD", "MSFT", "NVDA", "TSLA"],
                                                        date(2026, 10, 12))
     assert resume.history_calls == ["NVDA", "TSLA"]  # AMD and MSFT are not downloaded again
+
+
+def test_today_not_published_yet_is_skipped_not_fatal(tmp_path):
+    """Massive refuses today's grouped data before its end-of-day run."""
+    from invest.data import DataNotReady
+
+    class Early(FakeProvider):
+        def grouped(self, day):
+            if day >= date(2026, 10, 14):
+                raise DataNotReady("today's data before end of day")
+            return super().grouped(day)
+
+    store = BarStore(tmp_path, Early(), history_days=60)
+    store.update(["AMD"], date(2026, 10, 12))
+    frames = store.update(["AMD"], date(2026, 10, 14))  # no exception
+    assert frames["AMD"].index[-1].date() == date(2026, 10, 13)
+    assert store.splits == {}
