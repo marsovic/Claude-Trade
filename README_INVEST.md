@@ -125,6 +125,9 @@ days, beta ≥ 1.
 | Retail attention | ApeWisdom (Reddit / WallStreetBets) | none | — |
 | Earnings dates | Alpha Vantage EARNINGS_CALENDAR or Finnhub | same keys | 1 call/day |
 | Insider buying | SEC EDGAR Form 4 | `SEC_USER_AGENT="Name email"` | 10 req/s |
+| Insider history (event study) | SEC insider transactions data sets: every Form 3/4/5 since 2006, one zip per quarter | same | 10 req/s |
+| Announcements (event study) | SEC submissions JSON: every 8-K with its items and acceptance time | same | 10 req/s |
+| Attention history (event study) | Wikipedia pageviews (Wikimedia REST API, from July 2015), articles found via Wikidata | none (contact email in the User-Agent) | ~100 req/s |
 
 Not used:
 - Yahoo / yfinance: unofficial, against Yahoo's terms.
@@ -258,7 +261,88 @@ Useful flags: `--csv-dir DIR` (offline), `--start/--end`, `--locked-from 2022`, 
 
 `invest.backtest --placebo N` is a quicker, rougher check of the whole bot (random entries, same exits and sizing); the study's placebo is the calibrated one. Also compare with the equal-weight buy & hold the backtest prints next to SPY.
 
-## 7. Honest limitations
+## 7. Hunting smaller stocks: announcements and attention
+
+The price-only rules found no edge on large caps, so the next idea is to look at **public
+news about smaller companies**:
+- insiders buying their own stock;
+- results that surprise the market;
+- contracts;
+- a burst of attention on Reddit or Wikipedia.
+
+The bot does not use any of this yet. These signals get used, as filters or vetoes only,
+once `invest.events` validates them on data the rule has not seen.
+
+### What can be tested, and with what
+
+| Signal | Free history? | Source |
+|---|---|---|
+| Insider open-market purchases (Form 4, code P) | **yes, since 2006**, every listed company, with the ticker of the time | SEC insider data sets |
+| Results (8-K item 2.02), contracts (1.01), other news (7.01, 8.01) | **yes**, with the exact acceptance time | SEC submissions |
+| Wikipedia pageviews of the company | **yes, since July 2015** | Wikimedia |
+| Reddit mentions | **no**: ApeWisdom shows the last 24 h only, so a history must be **collected from now on** | ApeWisdom |
+| X / Twitter | no (the API is paid) | — |
+
+### The event study (`invest/events.py`)
+
+Every definition is fixed in the code before any result is seen:
+- `insider_buy`, `insider_cluster`, `insider_ceo_cfo`, `insider_conviction`;
+- `earnings_jump_up` and `earnings_jump_down`;
+- `agreement_8k`, `news_jump_8k`;
+- `wiki_spike`, `reddit_spike`.
+
+Each event is bought at the **open after it became public** and measured 20 sessions
+later. The comparison is made in three steps:
+1. against stocks of the same liquidity on the same days;
+2. then against the **same stocks on their ordinary days**. This placebo removes
+   survivorship: stocks that rose anyway look good on any day;
+3. then net of the FX fee and the spread.
+
+The statistical controls are the same as in `invest.study`: block bootstrap by week,
+Holm correction, and a DESIGN period that must hold on a LOCKED one.
+
+```bash
+# in .env: SEC_USER_AGENT="Prénom Nom ton@email"   (the SEC requires a name + email)
+
+# 1. Your 134 stocks, 2018-2026 (~10 min the first time: ~450 MB of SEC files)
+python -m invest.events --prices csv --csv-dir data_study/bars --out study_events
+
+# 2. EVERY US stock, delisted ones included, 2 years (Massive free key):
+#    ~100 min of prices + ~30 min of 8-K the first time, then minutes
+python -m invest.events --prices massive --days 730 --out study_events_massive
+
+# 3. Attention: Wikipedia history, then the study of spikes
+python -m invest.attention wiki --all-sec          # ~30 min the first time
+python -m invest.events --prices csv --csv-dir data_study/bars --families attention \
+    --out study_attention
+
+# 4. Reddit: one snapshot a day (Mac: `crontab -e`, the Mac must be awake at that time)
+# 30 23 * * 1-5 cd ~/Claude-Trade && .venv/bin/python -m invest.attention collect >> data_attention/collect.log 2>&1
+```
+
+Each run writes `report.md`, `events.csv`, `definitions.csv` and `summary.json`. The
+report also shows where events were lost:
+- no prices;
+- an insider price that does not match the market (a reused ticker or a typo);
+- a stock below 2 $ or below 1 M$ a day;
+- a repeat of an event already counted.
+
+### First result: 134 large caps, 2018-2026 (run on the SEC data, survivorship-biased prices)
+
+| Definition | Events (design / locked) | Edge over the same stocks' usual days, 20 sessions | Verdict |
+|---|---|---|---|
+| Insider buy ≥ 25 k$ | 276 / 173 | −0.1 % / +0.6 % | not proven |
+| CEO/CFO buy, cluster, conviction | 23 to 154 per period | from −0.7 % to +2.8 %, noise | not proven |
+| Results + jump ≥ +5 % (post-earnings drift) | 372 / 328 | **+1.6 % / +1.7 %** (Holm p = 0.050, locked p = 0.007) | not proven, **just at the threshold** |
+| Results + drop ≥ 5 % | 314 / 343 | −1.2 % / −2.5 % (locked p = 0.008) | not proven |
+| Contract / agreement (8-K 1.01) | 562 / 369 | −1.7 % / −1.1 % (locked p = 0.067) | design-only veto |
+
+What it means:
+- **Insider buying in large caps predicts nothing.** The literature finds the effect in small caps.
+- 98 % of the 49 010 insider purchases of the period are in stocks outside this list, which is why run no. 2 matters.
+- The drift after strong results is the most promising lead. It must now hold on the point-in-time universe (run no. 2) before anything changes in the bot.
+
+## 8. Honest limitations
 
 - **The edge may not exist any more.** Long-short momentum had a Sharpe of 0.12 over 2000–2025, against 0.45 since 1927. A good backtest proves nothing.
 - **Concentration.** 2–3 stocks means 35–40 % annual volatility, overnight gaps through stops, and correlated losses.
@@ -266,7 +350,7 @@ Useful flags: `--csv-dir DIR` (offline), `--start/--end`, `--locked-from 2022`, 
   - Today's curated universe brings survivorship bias.
   - Prices are split-adjusted, without dividends.
   - EUR/USD is constant unless an ECB series is loaded.
-  - News, Reddit, earnings and insider history are not replayed.
+  - The bot's backtest does not replay news, Reddit, earnings or insider history: `invest.events` measures them separately (section 7).
   - The VIX is used with a one-session lag, as live (FRED publishes it the next morning).
 - **Leveraged ETPs.** Volatility drag of roughly 3σ² per year at 3x. Real ETP prices and tickers depend on the broker.
 - **Data.** Alpaca market data needs the SIP feed (15-minute delay on the free plan):
@@ -282,6 +366,7 @@ Bot d'investissement **actions/ETP (sans crypto)** :
 - Il classe chaque soir ~130 actions US liquides par **momentum** et n'achète que si **7 conditions** sont alignées.
 - Il est **agressif** : 4 % de risque par trade, 2-3 positions, renforcement des gagnants, poche **ETP x3** optionnelle.
 - Le sentiment sert de filtre : news, manie Reddit, résultats trimestriels, achats d'initiés.
+- `invest.events` teste les annonces et l'attention sur les petites valeurs. Il couvre les achats d'initiés, les résultats, les contrats et les pics Wikipedia ou Reddit. Rien n'entre dans le bot sans validation (section 7).
 
 **Plateforme :**
 - **Trading 212** est la seule réellement viable à 100 € : API officielle, 0 commission, fractions d'actions. **Obtenez leur accord écrit** avant le réel, car leur outil officiel interdit le trading algorithmique (MiFID II).
