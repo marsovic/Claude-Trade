@@ -659,3 +659,33 @@ def test_cli_point_in_time_run_with_massive(tmp_path, monkeypatch):
     assert summary["funnel"]["earnings_jump_up"]["raw"] == 30
     assert len(list((tmp_path / "data" / "grouped").glob("*.csv.gz"))) >= 200
     assert "none by construction" in (tmp_path / "out" / "report.md").read_text()
+
+
+def test_days_just_outside_the_plan_window_are_skipped(tmp_path):
+    """Massive counts its 2-year window from its own clock: the oldest day of a 730-day
+    request can be refused. It is skipped; a refusal after a served day is an error."""
+    from invest.data import DataError
+
+    class Window:
+        def __init__(self, first, hole=None):
+            self.first, self.hole = first, hole
+
+        def grouped(self, day):
+            if day < self.first or day == self.hole:
+                raise DataError('Massive: endpoint not in your plan ({"status":"NOT_AUTHORIZED",'
+                                '"message":"Attempted to request data past historical '
+                                'entitlements."})')
+            return {"AAA": {"open": 1, "high": 1, "low": 1, "close": 1, "volume": 1}}
+
+    store = events.GroupedStore(tmp_path / "a", Window(date(2024, 10, 18)))
+    store.update(date(2024, 10, 16), date(2024, 10, 22))
+    got = sorted(f.name[:10] for f in (tmp_path / "a").glob("*.csv.gz"))
+    assert got == ["2024-10-18", "2024-10-21", "2024-10-22"]
+
+    gap = events.GroupedStore(tmp_path / "b", Window(date(2024, 10, 16), date(2024, 10, 18)))
+    with pytest.raises(DataError):
+        gap.update(date(2024, 10, 16), date(2024, 10, 22))
+
+    never = events.GroupedStore(tmp_path / "c", Window(date(2030, 1, 1)))
+    with pytest.raises(DataError):  # the whole range is refused: not a boundary effect
+        never.update(date(2024, 1, 1), date(2024, 12, 31))
