@@ -1,0 +1,109 @@
+{
+ "meta": {
+  "prices": "massive",
+  "survivorship": "none by construction: every stock that traded each day is in the data, including those delisted since. Only 2 years on the free plan, so the samples are small.",
+  "families": [
+   "insider",
+   "earnings",
+   "filings",
+   "attention"
+  ],
+  "hand_picked": false,
+  "first_day": "2024-10-17",
+  "last_day": "2026-10-16",
+  "symbols": 6480,
+  "groups": 10,
+  "locked_from": "2026-01-01",
+  "tradable_median": 3596.0
+ },
+ "funnel": {
+  "insider_buy": {
+   "raw": 10119,
+   "no price history for the ticker": 380,
+   "reported price far from the market price": 488,
+   "not tradable at t0 (no bar, price < $2 or volume < $1M/day)": 2660,
+   "repeat within 20 sessions of a counted one": 2980,
+   "kept": 3611
+  },
+  "insider_ceo_cfo": {
+   "raw": 2294,
+   "no price history for the ticker": 81,
+   "reported price far from the market price": 111,
+   "not tradable at t0 (no bar, price < $2 or volume < $1M/day)": 617,
+   "repeat within 20 sessions of a counted one": 348,
+   "kept": 1137
+  },
+  "insider_conviction": {
+   "raw": 2919,
+   "no price history for the ticker": 112,
+   "reported price far from the market price": 242,
+   "not tradable at t0 (no bar, price < $2 or volume < $1M/day)": 596,
+   "repeat within 20 sessions of a counted one": 507,
+   "kept": 1462
+  },
+  "insider_cluster": {
+   "raw": 924,
+   "no price history for the ticker": 32,
+   "reported price far from the market price": 50,
+   "not tradable at t0 (no bar, price < $2 or volume < $1M/day)": 263,
+   "kept": 579
+  },
+  "earnings_jump_up": {
+   "raw": 31827,
+   "no price history for the ticker": 70,
+   "reaction below the threshold or not measurable": 26486,
+   "after the last price": 3,
+   "not tradable at t0 (no bar, price < $2 or volume < $1M/day)": 4,
+   "repeat within 20 sessions of a counted one": 35,
+   "kept": 5229
+  },
+  "earnings_jump_down": {
+   "raw": 31827,
+   "no price history for the ticker": 70,
+   "reaction below the threshold or not measurable": 26163,
+   "not tradable at t0 (no bar, price < $2 or volume < $1M/day)": 102,
+   "repeat within 20 sessions of a counted one": 55,
+   "kept": 5437
+  },
+  "agreement_8k": {
+   "raw": 16647,
+   "no price history for the ticker": 74,
+   "after the last price": 16,
+   "not tradable at t0 (no bar, price < $2 or volume < $1M/day)": 7671,
+   "repeat within 20 sessions of a counted one": 1584,
+   "kept": 7302
+  },
+  "news_jump_8k": {
+   "raw": 53002,
+   "no price history for the ticker": 233,
+   "reaction below the threshold or not measurable": 49833,
+   "after the last price": 1,
+   "not tradable at t0 (no bar, price < $2 or volume < $1M/day)": 11,
+   "repeat within 20 sessions of a counted one": 452,
+   "kept": 2472
+  },
+  "wiki_spike": {
+   "raw": 3583,
+   "no price history for the ticker": 1371,
+   "before the first price day (not counted in raw)": 12447,
+   "not tradable at t0 (no bar, price < $2 or volume < $1M/day)": 179,
+   "repeat within 20 sessions of a counted one": 1230,
+   "kept": 803
+  },
+  "reddit_spike": {
+   "raw": 0
+  }
+ },
+ "verdicts": {
+  "insider_buy": "VALIDATED BUY",
+  "insider_cluster": "NOT PROVEN (design effect not significant after Holm)",
+  "insider_ceo_cfo": "VALIDATED BUY",
+  "insider_conviction": "VALIDATED BUY",
+  "earnings_jump_up": "DESIGN ONLY (did not hold in the locked period)",
+  "earnings_jump_down": "VALIDATED VETO",
+  "agreement_8k": "VALIDATED VETO",
+  "news_jump_8k": "NOT PROVEN (design effect not significant after Holm)",
+  "wiki_spike": "NOT PROVEN (design effect not significant after Holm)",
+  "reddit_spike": "NOT PROVEN (only 0 design events, 100 needed)"
+ }
+}
