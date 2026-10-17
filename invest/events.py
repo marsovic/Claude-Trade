@@ -845,8 +845,14 @@ class GroupedStore:
     def path(self, day: date) -> Path:
         return self.dir / f"{day}.csv.gz"
 
+    MAX_REFUSED = 15  # oldest days refused in a row before giving up
+
     def update(self, start: date, end: date) -> int:
-        from invest.data import DataNotReady
+        """Download the missing sessions, oldest first.  The provider counts its plan's
+        history window (2 years on Massive's free plan) from its own clock, so the oldest
+        day or two of a request can fall just outside it: those are skipped, as long as
+        they come before any day that was served."""
+        from invest.data import DataError, DataNotReady
         from invest.markets import is_trading_day
 
         days = [start + timedelta(days=i) for i in range((end - start).days + 1)]
@@ -855,11 +861,24 @@ class GroupedStore:
             eta = len(todo) * getattr(getattr(self.p, "limiter", None), "interval", 0.0) / 60
             log.info("grouped bars: %d session(s) to download (~%.0f min at the provider's "
                      "rate limit); each day is saved, a new run resumes", len(todo), eta)
+        served = bool(list(self.dir.glob("*.csv.gz")))
+        refused: list[date] = []
         for n, d in enumerate(todo, 1):
             try:
                 rows = self.p.grouped(d) or {}
             except DataNotReady:
                 break
+            except DataError as exc:
+                text = str(exc).lower()
+                outside = "entitlement" in text or "not_authorized" in text
+                if not outside or served or len(refused) >= self.MAX_REFUSED:
+                    raise
+                refused.append(d)
+                continue
+            if refused and not served:
+                log.warning("grouped bars: the provider's plan starts after %s; %d older "
+                            "session(s) skipped", refused[-1], len(refused))
+            served = True
             df = pd.DataFrame.from_dict(rows, orient="index")
             df.index.name = "symbol"
             tmp = self.path(d).with_suffix(".tmp")
@@ -1006,7 +1025,7 @@ def main(argv=None) -> int:
                 store.update(start, end)
             except DataError as exc:
                 raise EventStudyError(f"Massive refused a day ({exc}). The free plan covers "
-                                      "2 years: use --days 730 or less") from exc
+                                      "about 2 years: try --days 700") from exc
             uni = set(issuers["symbol"]) if issuers is not None and not issuers.empty else None
             p = panel_from_long(store.load(start, end, uni))
             survivorship = ("none by construction: every stock that traded each day is in "
