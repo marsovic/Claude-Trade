@@ -367,6 +367,9 @@ def main(argv=None) -> int:
     if s.is_live:
         log.warning("REAL MONEY on %s: capital %.2f EUR, %.0f%% risk per trade, %d slots.",
                     s.broker, s.initial_capital, s.risk_per_trade * 100, s.slots)
+        log.warning("No edge has been demonstrated: on 2019-2026 data this strategy returned "
+                    "about -10 %% to -28 %% while buying SPY returned +190 %% (README_INVEST.md, "
+                    "section 6). Paper trading first.")
     try:
         return bot.run_once() if args.once else bot.run_forever()
     except BotIsDead as dead:
