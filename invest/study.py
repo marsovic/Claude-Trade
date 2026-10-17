@@ -13,6 +13,14 @@ then the chosen ones are checked ONCE on the LOCKED years.
 Outputs in ``--out``: report.md (plain English), events.csv (the baseline events),
 variants.csv (one row per declared variant), summary.json.  The console prints the verdict.
 
+Downloaded prices are cached in ``--data-dir`` (default ``data_study``, separate from the
+bot's own cache, whose refresh keeps only a short history): a first download of ~130 stocks
+takes hours on a free plan (the log gives the estimate up front) and is resumable; a later run
+asks only for what is missing or older than a week, and ``--csv-dir data_study/bars`` re-runs
+fully offline.  The study stops with ``STUDY STOPPED: <cause>`` (exit code 2) on a missing
+key, no network, unreadable data or invalid arguments; a symbol the provider does not know
+(HTTP 404) is skipped with a warning (put it in INV_EXCLUDE).
+
 WHAT IS REAL.  ``build_panel``, ``regime_at`` and ``evaluate_day`` are the bot's own
 functions.  The baseline events come from ``evaluate_day`` itself (every day with the
 regime on).  The other variants only move thresholds, so their signals are re-evaluated
@@ -61,7 +69,9 @@ SIMPLIFICATIONS versus the live engine (honesty over pretence):
      EUR/USD is constant so FX P&L cancels; no share rounding, no minimum order size.
      Entries refused by ``max_cost_r`` are skipped.
   6. The 250-session horizon cap truncates the biggest winners, identically for all
-     variants; a position still open at the end of the data is marked to market.
+     variants; a position still open at the end of the data is marked to market.  The cap
+     frees the symbol, so the same trend may start a new event a session or two later (the
+     engine would still hold the position): rare, and the same for every variant.
   7. Daily bars only: when the low touches the stop the stop fills, even on the entry
      day, whatever happened first inside the bar (SimBroker does the same).
   8. Regime comes from ``regime_at`` with VIX lagged one observation, as the backtest does.
@@ -69,10 +79,17 @@ SIMPLIFICATIONS versus the live engine (honesty over pretence):
      in the backtest.
  10. Threshold variants that touch panel fields (min_price, atr_period, ...) or regime
      fields are refused: they need their own panel.
+ 11. The gap_atr filters use the NEXT session's open, which does not exist when the engine
+     places its limit order at the close: they can only be built as a check at the open.
 
 STATISTICS.  Metric = R measured against the BASELINE initial risk of the same event
 ("R_ref"), so that a wider stop is compared fairly with the default one (for every other
-variant R_ref is exactly the R of the trade).  Paired block bootstrap over ISO weeks
+variant R_ref is exactly the R of the trade), MINUS the market's move over the trade's
+holding window: beta (trailing, shrunk, past data only) x the return of the equal-weight
+universe from the signal close to the exit.  Mean R per event otherwise rewards time in the
+market: in a drifting sample (equity premium, high-beta names, today's survivors) a wider
+stop or trail holds longer and wins with no skill in the exit rule.  The unadjusted
+difference is kept in the tables as ``dR_raw``.  Paired block bootstrap over ISO weeks
 (whole weeks are resampled, baseline and variant together) for the difference of mean R,
 95 % interval; Holm-Bonferroni correction over the adoptable variants (declared "better";
 the "worse" diagnostics, which can never be adopted, are corrected among themselves),
@@ -81,8 +98,13 @@ intra-week correlation (warning when events cluster); the same difference de-clu
 the best-scored event per week and per day; sign stability per calendar year and
 leave-one-year-out; plateau check on neighbouring thresholds; the average equity
 contribution (R x the bot's real position weight) as a money check; random-entry placebo
-(same exits and costs).  Information-discreteness cut-offs come from design-period
-signals only; design trades that run into the locked years are purged.
+(same exits, costs and market adjustment; drawn among the stocks the signal itself starts
+from, i.e. the entry top of the momentum ranking, so that holding time is comparable; the
+baseline-minus-random difference gets a week-block bootstrap interval).  Information-
+discreteness cut-offs come from design-period signals only; design trades that run into the
+locked years are purged.  A variant must also gain at least 0.05 R and change at least 30
+events, and the locked years need at least 150 events (hard gate) and a one-sided significant
+difference (Holm over the selected variants).
 
 DECISION RULE (fixed before looking at any data; see ``DECISION_RULE``).
 """
@@ -90,24 +112,27 @@ DECISION RULE (fixed before looking at any data; see ``DECISION_RULE``).
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import logging
 import math
 import sys
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, fields, replace
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import requests
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from invest.backtest import load_csv_dir
-from invest.config import InvestSettings
-from invest.data import BarStore, fred_series, make_provider
+from invest.config import ConfigError, InvestSettings
+from invest.data import BarStore, DataError, empty_frame, fred_series, make_provider
+from invest.markets import is_trading_day
 from invest.risk import stop_distance_pct, stop_reason
 from invest.signals import Regime, build_panel, evaluate_day, regime_at
 from invest.universe import build_universe, data_symbols
@@ -115,9 +140,13 @@ from invest.universe import build_universe, data_symbols
 log = logging.getLogger("invest.study")
 
 BASELINE = "baseline"
+DRIFT_WARN = 0.08  # equal-weight universe growth per year above which the drift is flagged
 
 DECISION_RULE = """\
 A variant is adopted only if ALL of these hold.
+Metric: R against the baseline initial risk, net of the market's move over each trade's
+holding window (beta x the equal-weight universe return from the signal close to the exit),
+so that holding longer in a rising market earns nothing by itself.
 On the DESIGN years (chosen with no access to the LOCKED years):
   1. direction: it was declared 'better' in advance and its mean R is higher than the baseline;
   2. significance: the Holm-corrected p-value of the paired block bootstrap (whole ISO weeks)
@@ -125,19 +154,27 @@ On the DESIGN years (chosen with no access to the LOCKED years):
      interval of the difference excludes 0 after correction), and so is the same test with
      4-week blocks (trades last weeks and overlap, which a 1-week block would understate);
      the 'worse' diagnostics are corrected among themselves and can never be adopted;
-  3. stability: the sign of the difference is the same in at least 70% of the design
+  3. size: the gain is at least 0.05 R and the variant changes the outcome of at least 30
+     events (a bootstrap that rests on a handful of events is anti-conservative);
+  4. stability: the sign of the difference is the same in at least 70% of the design
      calendar years that have enough events, AND dropping any single design year leaves at
      least half of the gain (no single year carries the effect);
-  4. plateau: neighbouring thresholds point the same way (no spike; at least one
+  5. plateau: neighbouring thresholds point the same way (no spike; at least one
      neighbour must exist and none may reverse or collapse to under half of the gain);
-  5. coverage: it keeps at least 60% of the baseline events, or the events it keeps are
-     still at least 2 times what the slots can absorb in a year;
-  6. de-clustered check: the difference is also positive when only the best-scored event
+  6. coverage: it keeps at least 60% of the baseline events, or the events it keeps are
+     still at least 2 times what the slots can absorb in a year (a strong filter that fails
+     only this test is reported as 'real but not adoptable': the slots would sit idle);
+  7. de-clustered check: the difference is also positive when only the best-scored event
      of each week is kept;
-  7. money check: the average equity contribution per trade (R x the bot's real position
-     weight) is also higher.
-On the LOCKED years, evaluated ONCE and only for variants that passed 1-7:
-  8. the difference has the same sign and at least half of the design magnitude.
+  8. money check: the average equity contribution per trade (R x the bot's real position
+     weight, not adjusted) is also higher.
+On the LOCKED years, evaluated ONCE, only for variants that passed 1-8, and only if the locked
+years hold at least 150 events (below that nothing is evaluated and nothing is recommended):
+  9. the difference has the same sign, at least half of the design magnitude, AND is
+     significant: one-sided p <= 0.05 after Holm over the selected variants, with 1-week and
+     4-week blocks.
+At most ONE change is named: the one whose gain held in both periods (the smaller of the
+design and locked differences) is largest.
 Otherwise: keep the defaults.  A higher mean alone never counts."""
 
 # ----------------------------------------------------------------------------------
@@ -284,8 +321,15 @@ class Params:
     capacity_mult: float = 2.0
     magnitude_min: float = 0.5
     plateau_outer_min: float = 0.5
+    min_gain_r: float = 0.05  # a variant must gain at least this much R (no micro-variants)
+    min_changed_events: int = 30  # ... and change the outcome of at least this many events
+    drift_adjust: bool = True  # judge variants net of the market move over each holding window
+    beta_window: int = 126
     start: str | None = None
     end: str | None = None
+    vix_failed: bool = False  # the CLI could not load VIX/VIX3M and --no-vix was not given
+    vix_disabled: bool = False  # --no-vix: the user chose to run without VIX/VIX3M
+    live_fee_preset: str = ""  # the live broker's fee preset when it differs from the study's
 
 
 # ==================================================================================
@@ -500,6 +544,64 @@ def filter_mask(v: Variant, feats: Mapping[str, np.ndarray],
 
 
 # ==================================================================================
+# market drift: what a position earns just by being invested
+# ==================================================================================
+@dataclass
+class MarketMove:
+    """Equal-weight universe index and every stock's trailing beta to it.
+
+    Mean R per event rewards TIME IN THE MARKET: in a sample with positive drift (equity
+    premium, high-beta names, today's-universe survivorship) a wider stop or trail holds
+    longer and wins by construction, with no skill in the exit rule.  Every variant is
+    therefore judged net of ``beta * (universe return over the holding window)``."""
+
+    idx: np.ndarray  # (T,) equal-weight universe index, 1.0 on the first session
+    beta: np.ndarray  # (T, N) shrunk trailing beta known at each session's close
+    cagr: float = float("nan")  # compound annual growth of the index over the analysed years
+
+    def window(self, t_in: np.ndarray, t_out: np.ndarray) -> np.ndarray:
+        """Universe return from the close of session ``t_in`` to the close of ``t_out``."""
+        return self.idx[t_out] / self.idx[t_in] - 1.0
+
+    def drift(self, t0: np.ndarray, j: np.ndarray, t_out: np.ndarray) -> np.ndarray:
+        """beta x universe return over the holding window (a fraction of the entry notional)."""
+        return self.beta[t0, j] * self.window(t0, t_out)
+
+
+def market_move(g: Grid, window: int = 126, shrink: float = 0.5) -> MarketMove:
+    """Equal-weight index of the universe and trailing betas (past data only: the beta of
+    session t uses returns up to the close of t, which is when a signal is generated)."""
+    C = g.A["close"]
+    with np.errstate(invalid="ignore", divide="ignore"):
+        r = np.vstack([np.full((1, g.N), np.nan), C[1:] / C[:-1] - 1.0])
+    # a +-60 %/+100 % day of a large cap is almost always a data error: one bad print must not
+    # move the index (and the drift charged to every trade that spans that day)
+    r = np.where(np.isfinite(r), np.clip(r, -0.6, 1.0), np.nan)
+    cnt = np.isfinite(r).sum(axis=1)
+    ew = np.where(cnt > 0, np.nansum(r, axis=1) / np.maximum(cnt, 1), 0.0)
+    idx = np.cumprod(1.0 + ew)
+    beta = np.ones_like(r)
+    mp = max(window // 2, 10)
+    if g.N and mp < g.T:
+        e = pd.Series(ew)
+        cov = pd.DataFrame(r).rolling(window, min_periods=mp).cov(e)
+        var = e.rolling(window, min_periods=mp).var()
+        with np.errstate(invalid="ignore", divide="ignore"):
+            raw = cov.to_numpy() / var.to_numpy()[:, None]
+        beta = np.where(np.isfinite(raw), (1 - shrink) * raw + shrink, 1.0)
+        beta = np.clip(beta, 0.0, 3.0)
+    return MarketMove(idx=idx, beta=beta)
+
+
+def annual_growth(idx: np.ndarray, a: int, b: int) -> float:
+    """Compound annual growth of an index between sessions a and b-1 (252 sessions a year)."""
+    n = b - 1 - a
+    if n < 20 or not (np.isfinite(idx[a]) and idx[a] > 0 and idx[b - 1] > 0):
+        return float("nan")
+    return float((idx[b - 1] / idx[a]) ** (252.0 / n) - 1.0)
+
+
+# ==================================================================================
 # trade simulator, vectorised over events (mirrors Engine.process_day + SimBroker)
 # ==================================================================================
 @dataclass
@@ -514,6 +616,8 @@ class Sim:
     held: np.ndarray
     net_ret: np.ndarray  # net return of the trade per $ of entry notional, after all costs
     weight: np.ndarray  # the bot's position weight for this stop distance
+    refused: np.ndarray | None = None  # entry refused because the round trip costs > max_cost_r
+    invalid: np.ndarray | None = None  # trade dropped: non-finite price or R (data problem)
 
     @property
     def n(self) -> int:
@@ -570,18 +674,22 @@ def simulate(g: Grid, t0: np.ndarray, j: np.ndarray, s, off: np.ndarray, horizon
     fill = np.where(open_fill, np.minimum(o1 * (1 + slip), limit), limit)
     sp = np.array([stop_distance_pct(float(p), float(a), s) for p, a in zip(limit, sig_atr)],
                   dtype=float)
-    filled = (open_fill | lim_fill) & np.isfinite(sp) & np.isfinite(fill)
+    with np.errstate(invalid="ignore"):
+        zero_px = (open_fill | lim_fill) & ~(fill > 0)  # open = 0 or a missing price
+    filled = (open_fill | lim_fill) & np.isfinite(sp) & np.isfinite(fill) & ~zero_px
     # max_cost_r: the engine refuses an entry whose round trip costs too much (in R)
     f_lim, _ = _fee_fractions(s, np.where(filled, limit, 1.0), np.where(filled, limit, 1.0),
                               np.where(filled, sp, 0.1), ref_equity)
     with np.errstate(invalid="ignore", divide="ignore"):
-        filled &= (2 * f_lim / sp) <= s.max_cost_r
+        too_dear = filled & ((2 * f_lim / sp) > s.max_cost_r)
+        filled &= ~too_dear
 
     res = Sim(filled=filled, kind=np.where(open_fill, 0, 1).astype(np.int8),
               fill=np.where(filled, fill, np.nan), sp=np.where(filled, sp, np.nan),
               exit_t=np.full(n, -1, dtype=np.int64), exit_px=np.full(n, np.nan),
               reason=np.full(n, "", dtype=object), held=np.zeros(n, dtype=np.int64),
-              net_ret=np.full(n, np.nan), weight=np.full(n, np.nan))
+              net_ret=np.full(n, np.nan), weight=np.full(n, np.nan), refused=too_dear,
+              invalid=zero_px.copy())
 
     last_valid = np.full(g.N, np.nan)
     for k in range(g.N):
@@ -648,7 +756,7 @@ def simulate(g: Grid, t0: np.ndarray, j: np.ndarray, s, off: np.ndarray, horizon
             new_stop = np.maximum(stop, np.where(atr_eff > 0, high - dist, stop))
             stop = np.where(alive & (new_stop > stop * 1.0005), new_stop, stop)
             if d > 0:
-                held = held + alive
+                held = held + (alive | hz)  # a position sold at the horizon close lived that day
             rmult = (c - fl) / (fl * spp)
             hold, r6 = PH[kk, jj], R6[kk, jj]
             fri = rebal[kk]
@@ -681,8 +789,19 @@ def simulate(g: Grid, t0: np.ndarray, j: np.ndarray, s, off: np.ndarray, horizon
 
     f = np.nonzero(filled)[0]
     f_in, f_out = _fee_fractions(s, res.fill[f], res.exit_px[f], res.sp[f], ref_equity)
-    res.net_ret[f] = res.exit_px[f] / res.fill[f] - 1 - f_in - f_out
+    with np.errstate(invalid="ignore", divide="ignore"):
+        res.net_ret[f] = res.exit_px[f] / res.fill[f] - 1 - f_in - f_out
     res.weight[f] = position_weight(res.sp[f], s, ref_equity)
+    # a zero or missing price (open = 0 on the entry bar, a bad exit bar...) gives an infinite
+    # or NaN R, which would turn every mean and every difference into NaN: drop the trade
+    # and let the caller say so loudly
+    bad = f[~(np.isfinite(res.net_ret[f]) & np.isfinite(res.weight[f]))]
+    if len(bad):
+        res.invalid[bad] = True
+        res.filled[bad] = False
+        res.net_ret[bad] = np.nan
+        res.weight[bad] = np.nan
+        res.reason[bad] = "invalid price data"
     return res
 
 
@@ -699,15 +818,24 @@ class EventSet:
     j: np.ndarray
     exit_t: np.ndarray  # session index of the exit fill
     R: np.ndarray  # R against the variant's own initial risk (net of costs)
-    Rref: np.ndarray  # R against the BASELINE initial risk (the decision metric)
+    Rref: np.ndarray  # R against the BASELINE initial risk (raw)
     eq: np.ndarray  # equity contribution in % at the bot's position weight
     score: np.ndarray
     held: np.ndarray
     reason: np.ndarray
+    # Rx = the DECISION metric: Rref net of the market's move over the holding window
+    # (beta x equal-weight universe return from the signal close to the exit).  Without it a
+    # wider stop or trail would "win" in any drifting sample just by being invested longer.
+    # Left out (None) it equals Rref.
+    Rx: np.ndarray | None = None
+
+    def __post_init__(self):
+        if self.Rx is None:
+            self.Rx = self.Rref
 
     def sel(self, mask: np.ndarray) -> EventSet:
         return EventSet(self.name, *(getattr(self, f)[mask] for f in (
-            "t0", "j", "exit_t", "R", "Rref", "eq", "score", "held", "reason")))
+            "t0", "j", "exit_t", "R", "Rref", "eq", "score", "held", "reason", "Rx")))
 
     @property
     def n(self) -> int:
@@ -863,7 +991,7 @@ def _leave_one_year_out(ev: EventSet, base: EventSet, yv, yb, years) -> float:
     for y in years:
         mv, mb = yv != y, yb != y
         if mv.any() and mb.any():
-            out.append(float(ev.Rref[mv].mean() - base.Rref[mb].mean()))
+            out.append(float(ev.Rx[mv].mean() - base.Rx[mb].mean()))
     return min(out) if out else float("nan")
 
 
@@ -872,6 +1000,18 @@ def _groups(family) -> list[list[str]]:
     if not family:
         return []
     return [list(g) for g in family] if isinstance(family[0], (list, tuple)) else [list(family)]
+
+
+def _n_changed(ev: EventSet, base: EventSet) -> int:
+    """Events on which the variant differs from the baseline: taken by only one of them, or
+    taken by both with a different result.  A paired bootstrap of a difference that rests on
+    a handful of events is anti-conservative (nearly every draw sees the same few events), so
+    the decision rule asks for a minimum."""
+    kv = ev.t0.astype(np.int64) * 1_000_003 + ev.j
+    kb = base.t0.astype(np.int64) * 1_000_003 + base.j
+    common, iv, ib = np.intersect1d(kv, kb, return_indices=True)
+    differ = int((np.abs(ev.Rx[iv] - base.Rx[ib]) > 1e-9).sum())
+    return int(len(kv) + len(kb) - 2 * len(common)) + differ
 
 
 def analyse_segment(sets: Mapping[str, EventSet], cal: Calendar, a: int, b: int,
@@ -889,8 +1029,8 @@ def analyse_segment(sets: Mapping[str, EventSet], cal: Calendar, a: int, b: int,
         ev = sets[nm]
         wk = cal.wk[ev.t0] - cal.wk[a]
         dec = _first_per_key(wk, ev.score) if ev.n else np.zeros(0, dtype=int)
-        for kind, vals, idx in (("R", ev.Rref, slice(None)), ("eq", ev.eq, slice(None)),
-                                ("dec", ev.Rref, dec)):
+        for kind, vals, idx in (("R", ev.Rx, slice(None)), ("eq", ev.eq, slice(None)),
+                                ("dec", ev.Rx, dec)):
             w_, v_ = wk[idx], vals[idx]
             cols_S.append(np.bincount(w_, weights=v_, minlength=W))
             cols_C.append(np.bincount(w_, minlength=W).astype(float))
@@ -901,7 +1041,7 @@ def analyse_segment(sets: Mapping[str, EventSet], cal: Calendar, a: int, b: int,
     bw = max(int(params.block_weeks), 1)
     Wb = (W + bw - 1) // bw
     blk = {nm: (cal.wk[sets[nm].t0] - cal.wk[a]) // bw for nm in names}
-    Sb = np.column_stack([np.bincount(blk[nm], weights=sets[nm].Rref, minlength=Wb)
+    Sb = np.column_stack([np.bincount(blk[nm], weights=sets[nm].Rx, minlength=Wb)
                           for nm in names])
     Cb = np.column_stack([np.bincount(blk[nm], minlength=Wb).astype(float) for nm in names])
     means_b = _boot_means(Sb, Cb, params.n_boot, seed + 1000)
@@ -920,6 +1060,7 @@ def analyse_segment(sets: Mapping[str, EventSet], cal: Calendar, a: int, b: int,
                     "avg_R": perf["avg"], "median_R": float(np.median(ev.R)) if ev.n else np.nan,
                     "payoff": perf["payoff"], "profit_factor": perf["pf"],
                     "avg_R_ref": float(ev.Rref.mean()) if ev.n else np.nan,
+                    "avg_R_x": float(ev.Rx.mean()) if ev.n else np.nan,
                     "avg_eq_pct": float(ev.eq.mean()) if ev.n else np.nan,
                     "median_hold": float(np.median(ev.held)) if ev.n else np.nan})
         for kind, tag in (("R", "dR"), ("eq", "d_eq"), ("dec", "d_dec")):
@@ -939,8 +1080,13 @@ def analyse_segment(sets: Mapping[str, EventSet], cal: Calendar, a: int, b: int,
         day_key = ev.t0
         dd = _first_per_key(day_key, ev.score) if ev.n else np.zeros(0, dtype=int)
         bd = _first_per_key(base.t0, base.score) if base.n else np.zeros(0, dtype=int)
-        row["d_day"] = (float(ev.Rref[dd].mean() - base.Rref[bd].mean())
+        row["d_day"] = (float(ev.Rx[dd].mean() - base.Rx[bd].mean())
                         if len(dd) and len(bd) else np.nan)
+        # the same difference WITHOUT the market adjustment (information: how much of the gain
+        # is just time in the market), and how many events differ from the baseline at all
+        row["dR_raw"] = (float(ev.Rref.mean() - base.Rref.mean())
+                         if ev.n and base.n and nm != BASELINE else 0.0)
+        row["n_changed"] = _n_changed(ev, base) if nm != BASELINE else 0
         # sign stability per calendar year
         yv = cal.yr[ev.t0]
         yb = cal.yr[base.t0]
@@ -950,12 +1096,12 @@ def analyse_segment(sets: Mapping[str, EventSet], cal: Calendar, a: int, b: int,
             mv, mb = yv == y, yb == y
             if mv.sum() >= params.min_year_events and mb.sum() >= params.min_year_events:
                 used += 1
-                diffs.append(float(ev.Rref[mv].mean() - base.Rref[mb].mean()))
+                diffs.append(float(ev.Rx[mv].mean() - base.Rx[mb].mean()))
         row["years_used"] = used
         row["year_diffs"] = diffs
         row["loyo_min"] = _leave_one_year_out(ev, base, yv, yb, years)
         wk_ev = cal.wk[ev.t0]
-        n_eff, rho, m_bar = effective_n(ev.Rref, wk_ev) if ev.n else (0.0, 0.0, 1.0)
+        n_eff, rho, m_bar = effective_n(ev.Rx, wk_ev) if ev.n else (0.0, 0.0, 1.0)
         row.update({"n_eff": n_eff, "icc": rho, "events_per_week": m_bar})
         rows.append(row)
     df = pd.DataFrame(rows).set_index("variant")
@@ -1033,9 +1179,9 @@ def select_on_design(design_sets: Mapping[str, EventSet], table: pd.DataFrame,
         if ev.n and (ev.t0.max() >= locked_start or ev.exit_t.max() >= locked_start):
             raise LeakError(f"LOCKED data reached the selection ({nm})")
     out = table.copy()
-    flags = {k: [] for k in ("c_sign", "c_holm", "c_years", "c_plateau", "c_keep", "c_decl",
-                             "c_eq", "design_pass", "plateau", "plateau_note", "justified",
-                             "years_same_sign", "year_share")}
+    flags = {k: [] for k in ("c_sign", "c_holm", "c_size", "c_years", "c_plateau", "c_keep",
+                             "c_decl", "c_eq", "design_pass", "coverage_only", "plateau",
+                             "plateau_note", "justified", "years_same_sign", "year_share")}
     untested = {"plateau": "", "plateau_note": "", "years_same_sign": "", "year_share": np.nan}
     base = design_sets[BASELINE]
     hold = float(np.median(base.held)) if base.n else 30.0
@@ -1050,6 +1196,9 @@ def select_on_design(design_sets: Mapping[str, EventSet], table: pd.DataFrame,
         better = v.expect == "better"
         c_sign = bool(better and r["dR"] > 0)
         c_holm = bool(r["p_holm"] <= params.alpha and r["p_holm_blk"] <= params.alpha)
+        # size: a bootstrap that rests on a handful of changed events is anti-conservative and
+        # a gain of a few hundredths of R is not worth a parameter change
+        c_size = bool(r["dR"] >= params.min_gain_r and r["n_changed"] >= params.min_changed_events)
         diffs = np.asarray(r["year_diffs"], dtype=float)
         n_same = int((diffs > 0).sum())
         share = n_same / len(diffs) if len(diffs) else np.nan
@@ -1062,10 +1211,12 @@ def select_on_design(design_sets: Mapping[str, EventSet], table: pd.DataFrame,
         c_keep = bool(r["keep"] >= params.keep_min or justified)
         c_decl = bool(r["d_dec"] > 0)
         c_eq = bool(r["d_eq"] > 0)
-        ok = c_sign and c_holm and c_years and plat == "ok" and c_keep and c_decl and c_eq
-        for k, val in (("c_sign", c_sign), ("c_holm", c_holm), ("c_years", c_years),
-                       ("c_plateau", plat == "ok"), ("c_keep", c_keep), ("c_decl", c_decl),
-                       ("c_eq", c_eq), ("design_pass", ok), ("plateau", plat),
+        rest = c_sign and c_holm and c_size and c_years and plat == "ok" and c_decl and c_eq
+        ok = rest and c_keep
+        for k, val in (("c_sign", c_sign), ("c_holm", c_holm), ("c_size", c_size),
+                       ("c_years", c_years), ("c_plateau", plat == "ok"), ("c_keep", c_keep),
+                       ("c_decl", c_decl), ("c_eq", c_eq), ("design_pass", ok),
+                       ("coverage_only", bool(rest and not c_keep)), ("plateau", plat),
                        ("plateau_note", note), ("justified", justified),
                        ("years_same_sign", f"{n_same}/{len(diffs)}"), ("year_share", share)):
             flags[k].append(val)
@@ -1078,42 +1229,61 @@ def select_on_design(design_sets: Mapping[str, EventSet], table: pd.DataFrame,
 # placebo: random entries with the same exits and costs
 # ==================================================================================
 def placebo_summary(pool: EventSet | None, base: EventSet, cal: Calendar, draws: int,
-                    seed: int, by_year: bool) -> dict:
-    """Mean R of ``draws`` random samples of the pool, as many events as the baseline
-    (per calendar year when ``by_year``), against the baseline mean R."""
+                    seed: int, by_year: bool, lo: int, hi: int) -> dict:
+    """Baseline against matched random entries, on the decision metric (``Rx``).
+
+    Both means are resampled together by whole ISO weeks of the sessions [lo, hi), so the
+    baseline's own sampling noise and its clustering are part of the answer: ``diff`` is the
+    baseline mean minus the random-entry mean, with its 95 % interval and the one-sided
+    p-value that the baseline is NOT better.  ``by_year`` weights the pool so that every
+    calendar year counts as often as in the baseline.  (The old "percentile among random
+    draws" ignored the baseline's own noise and was not a probability.)"""
     if pool is None or pool.n == 0 or base.n == 0:
         return {"draws": 0}
-    rng = np.random.default_rng(seed)
-    base_mean = float(base.R.mean())
-    yrs_pool = cal.yr[pool.t0]
-    tot = np.zeros(draws)
-    n_tot = 0
+    W = int(cal.wk[hi - 1] - cal.wk[lo] + 1)
+    wb = cal.wk[base.t0] - cal.wk[lo]
+    wp = cal.wk[pool.t0] - cal.wk[lo]
+    weights = np.ones(pool.n)
+    keep_pool = np.ones(pool.n, dtype=bool)
+    keep_base = np.ones(base.n, dtype=bool)
     if by_year:
-        yb = cal.yr[base.t0]
-        matched = np.zeros(base.n, dtype=bool)
+        yb, yp = cal.yr[base.t0], cal.yr[pool.t0]
+        weights = np.zeros(pool.n)
         for y in np.unique(yb):
-            ny = int((yb == y).sum())
-            pv = pool.R[yrs_pool == y]
-            if len(pv) == 0:
-                continue  # no random entry available that year: compare the other years
-            idx = rng.integers(0, len(pv), size=(draws, ny))
-            tot += pv[idx].sum(axis=1)
-            n_tot += ny
-            matched |= yb == y
-        base_mean = float(base.R[matched].mean()) if matched.any() else base_mean
-    else:
-        n_tot = base.n
-        for lo in range(0, draws, 250):
-            hi = min(draws, lo + 250)
-            idx = rng.integers(0, pool.n, size=(hi - lo, n_tot))
-            tot[lo:hi] = pool.R[idx].sum(axis=1)
-    means = tot / max(n_tot, 1)
-    return {"draws": draws, "events": int(n_tot), "baseline_avg_R": base_mean,
-            "random_avg_R_mean": float(means.mean()),
-            "random_avg_R_p5": float(np.percentile(means, 5)),
-            "random_avg_R_p95": float(np.percentile(means, 95)),
-            "baseline_percentile": float((means < base_mean).mean() * 100),
-            "p_value_one_sided": float((np.sum(means >= base_mean) + 1) / (draws + 1)),
+            ny, npool = int((yb == y).sum()), int((yp == y).sum())
+            if npool:
+                weights[yp == y] = ny / npool
+        keep_pool = weights > 0
+        keep_base = np.isin(yb, np.unique(yp[keep_pool]))  # years with no random entry: skipped
+        if not keep_base.any():
+            return {"draws": 0}
+
+    def cols(week, vals, w, keep):
+        return (np.bincount(week[keep], weights=(vals * w)[keep], minlength=W),
+                np.bincount(week[keep], weights=w[keep], minlength=W))
+
+    sb, cb = cols(wb, base.Rx, np.ones(base.n), keep_base)
+    sp_, cp = cols(wp, pool.Rx, weights, keep_pool)
+    rb, cr = cols(wb, base.Rref, np.ones(base.n), keep_base)
+    rp, cq = cols(wp, pool.Rref, weights, keep_pool)
+    S = np.column_stack([sb, sp_, rb, rp])
+    Cn = np.column_stack([cb, cp, cb, cq])
+    means = _boot_means(S, Cn, draws, seed)
+    d = means[:, 0] - means[:, 1]
+    with np.errstate(invalid="ignore", divide="ignore"):
+        point = S.sum(axis=0) / Cn.sum(axis=0)
+    lo_d, hi_d = _ci(d, 0.95)
+    ok = np.isfinite(d)
+    p_one = float((np.sum(d[ok] <= 0) + 1) / (ok.sum() + 1)) if ok.any() else float("nan")
+    return {"draws": draws, "events": int(keep_base.sum()),
+            "baseline_avg_R": float(point[0]), "random_avg_R_mean": float(point[1]),
+            "random_avg_R_p5": float(np.nanpercentile(means[:, 1], 5)),
+            "random_avg_R_p95": float(np.nanpercentile(means[:, 1], 95)),
+            "baseline_avg_R_raw": float(point[2]), "random_avg_R_raw": float(point[3]),
+            "diff": float(point[0] - point[1]), "diff_lo": lo_d, "diff_hi": hi_d,
+            "p_value_one_sided": p_one,
+            "baseline_hold": float(np.mean(base.held[keep_base])),
+            "random_hold": float(np.average(pool.held[keep_pool], weights=weights[keep_pool])),
             "matched_by_year": bool(by_year), "pool_events": int(pool.n)}
 
 
@@ -1139,6 +1309,88 @@ class StudyResult:
     variants_table: pd.DataFrame
     audit: dict
     checks: dict
+
+
+def _bar_problems(bars: Mapping[str, pd.DataFrame], symbols: Sequence[str]) -> list[str]:
+    """Warnings about bars the study cannot trust (zero or negative prices, high < low).  A
+    zero open or low is not dropped by the data layer; it would give an infinite R."""
+    bad = {}
+    for sym in dict.fromkeys(symbols):
+        df = bars.get(sym)
+        if df is None or df.empty:
+            continue
+        px = df[["open", "high", "low", "close"]]
+        n = int(((px <= 0).any(axis=1) | (df["high"] < df["low"])).sum())
+        if n:
+            bad[sym] = n
+    if not bad:
+        return []
+    shown = ", ".join(f"{k} ({v})" for k, v in list(bad.items())[:8])
+    return [f"DATA PROBLEM: {sum(bad.values())} bar(s) with a zero or negative price or "
+            f"high < low in {len(bad)} symbol(s): {shown}. Trades that touch them are dropped "
+            "or distorted: fix or exclude these symbols (INV_EXCLUDE) and run again"]
+
+
+def _vix_status(vix, vix3m, p: Params, cal: pd.DatetimeIndex, a: int, b: int,
+                warnings: list[str]) -> dict:
+    """What the regime knew about VIX / VIX3M (the live bot's VIX gates: VIX <= 30, VIX/VIX3M
+    <= 1, VIX exit above 35).  Without them the baseline events no longer match the live bot."""
+
+    def span(x):
+        if x is None or len(x) == 0:
+            return None
+        return {"first": str(x.index[0].date()), "last": str(x.index[-1].date()), "n": len(x)}
+
+    v, v3 = span(vix), span(vix3m)
+    if p.vix_failed:
+        status = "unavailable"
+        warnings.append(
+            "VIX / VIX3M could not be downloaded (FRED): the regime has NO VIX gates, so the "
+            "events include days on which the live bot would not buy. NO recommendation is "
+            "made. Fix the connection and run again, or pass --no-vix to accept a SPY-only "
+            "regime on purpose")
+    elif v is None:
+        status = "off"
+        warnings.append(
+            "VIX / VIX3M are not used: the regime is the SPY trend only, so the events include "
+            "days on which the live bot (VIX <= 30, VIX/VIX3M <= 1, exit above 35) would not "
+            "buy" + (" (chosen with --no-vix)" if p.vix_disabled else ""))
+    else:
+        status = "loaded"
+        first, last = cal[a], cal[b - 1]
+        if pd.Timestamp(v["first"]) > first + pd.Timedelta(days=10):
+            warnings.append(f"VIX starts on {v['first']}, after the first signal day "
+                            f"{first.date()}: the VIX gates are inactive before that")
+        if pd.Timestamp(v["last"]) < last - pd.Timedelta(days=10):
+            warnings.append(f"VIX ends on {v['last']}, before the last session "
+                            f"{last.date()}: the VIX gates are inactive after that")
+        if v3 is None:
+            warnings.append("VIX3M is missing: the term-structure gate (VIX/VIX3M <= 1) is off")
+    return {"status": status, "vix": v, "vix3m": v3}
+
+
+def _check_params(p: Params) -> None:
+    """Refuse values that would silently give a meaningless study (or a traceback)."""
+    problems = []
+    if p.n_boot < 1:
+        problems.append(f"n_boot={p.n_boot} (about 10000 for a real study)")
+    if p.horizon < 2:
+        problems.append(f"horizon={p.horizon} (every trade would close at the entry-day close)")
+    if not 0.0 < p.design_frac < 1.0:
+        problems.append(f"design_frac={p.design_frac} (must be strictly between 0 and 1)")
+    if p.ref_equity is not None and not p.ref_equity > 0:
+        problems.append(f"ref_equity={p.ref_equity} (must be above 0)")
+    if p.placebo_draws < 0:
+        problems.append(f"placebo_draws={p.placebo_draws}")
+    for name in ("start", "end"):
+        value = getattr(p, name)
+        if value:
+            try:
+                pd.Timestamp(value)
+            except (ValueError, TypeError):
+                problems.append(f"{name}={value!r} is not a date")
+    if problems:
+        raise StudyError("invalid study parameters: " + "; ".join(problems))
 
 
 def _check_variants(variants: Sequence[Variant], s) -> list[Variant]:
@@ -1188,6 +1440,7 @@ def run_study(bars: dict[str, pd.DataFrame], s, vix: pd.Series | None = None,
               params: Params | None = None, progress=None) -> StudyResult:
     """Run the whole walk-forward study on in-memory bars (see the module docstring)."""
     p = params or Params()
+    _check_params(p)
     say = progress or (lambda msg: log.info("%s", msg))
     variants = _check_variants(list(VARIANTS if variants is None else variants), s)
     skipped_controls = []
@@ -1204,6 +1457,11 @@ def run_study(bars: dict[str, pd.DataFrame], s, vix: pd.Series | None = None,
     diagnostics = [v.name for v in variants if v.role == "test" and v.expect == "worse"]
     ref_equity = s.initial_capital if p.ref_equity is None else p.ref_equity
     warnings: list[str] = []
+    if p.live_fee_preset:
+        warnings.append(
+            f"trades are costed with the '{s.fee_preset or s.broker}' fee preset but your live "
+            f"broker uses '{p.live_fee_preset}': set INV_FEE_PRESET={p.live_fee_preset} to "
+            "cost them like the live broker")
 
     # ---- data, panel, regime -----------------------------------------------------
     if p.end:
@@ -1211,11 +1469,16 @@ def run_study(bars: dict[str, pd.DataFrame], s, vix: pd.Series | None = None,
     universe = [u for u in build_universe(s.universe or None, s.exclude) if u in bars]
     if not universe or s.benchmark not in bars:
         raise StudyError("no usable universe or no benchmark bars")
+    warnings.extend(_bar_problems(bars, universe + [s.benchmark]))
     say(f"building the panel for {len(universe)} stocks...")
     panel = build_panel(bars, universe, s)
+    if not panel:
+        raise StudyError("no stock has enough usable history to build the panel (each needs "
+                         f"at least {s.min_history} sessions): use more history or other stocks")
     cal = bars[s.benchmark].index
     g = build_grid(panel, cal)
     cald = make_calendar(cal)
+    mm = market_move(g, p.beta_window)
     vix_l = lag_series(vix) if vix is not None else pd.Series(dtype=float)
     vix3_l = lag_series(vix3m) if vix3m is not None else pd.Series(dtype=float)
     regs = regime_list(bars, vix_l, vix3_l, s, cal)
@@ -1227,6 +1490,14 @@ def run_study(bars: dict[str, pd.DataFrame], s, vix: pd.Series | None = None,
     if a >= b - 2:
         raise StudyError("not enough history after the warm-up to run a study")
     days = list(range(a, b))
+    mm.cagr = annual_growth(mm.idx, a, b)
+    vix_note = _vix_status(vix, vix3m, p, cal, a, b, warnings)
+    if p.drift_adjust and np.isfinite(mm.cagr) and mm.cagr > DRIFT_WARN:
+        warnings.append(
+            f"the equal-weight universe grew {mm.cagr:.0%} a year in this sample (a bull "
+            "market, and today's universe is made of survivors): any variant that holds longer "
+            "earns that drift. Every variant is judged net of beta x the universe return over "
+            "its holding window, but treat a wider stop or trail with extra caution")
 
     # ---- walk-forward split, fixed before any result exists ------------------------------
     years = sorted({int(y) for y in cald.yr[a:b]})
@@ -1256,7 +1527,8 @@ def run_study(bars: dict[str, pd.DataFrame], s, vix: pd.Series | None = None,
         warnings.append("signal audit is OFF: signals come from the vectorised mirror of "
                         "signals.evaluate and were not compared with the real function")
     else:
-        say("baseline signals with the bot's own evaluate_day...")
+        say("baseline signals with the bot's own evaluate_day (the slowest step, about a "
+            "minute for 130 stocks and 10 years; --audit off skips it)...")
         real_base = real_signals(panel, g, regs, s, days)
         if not np.array_equal(real_base[a:b], base_sig[a:b]):
             bad = np.argwhere(real_base[a:b] != base_sig[a:b])[0]
@@ -1281,7 +1553,9 @@ def run_study(bars: dict[str, pd.DataFrame], s, vix: pd.Series | None = None,
                 audit["variant_cells_checked"] += audit_signals(panel, g, regs, sv, m, sample,
                                                                 v.name)
         svs[v.name] = keyed[key]
-    say(f"signals ready: {int(base_sig.sum())} raw baseline signals")
+    # a signal on the last session has no next open and can never trade: it is not counted
+    raw_signals = int(base_sig[:g.T - 1].sum())
+    say(f"signals ready: {raw_signals} raw baseline signals")
 
     # ---- candidates ---------------------------------------------------------------
     union = np.zeros_like(base_sig)
@@ -1311,6 +1585,24 @@ def run_study(bars: dict[str, pd.DataFrame], s, vix: pd.Series | None = None,
         sm = simulate(g, t0[sel], j[sel], grp["s"], off, p.horizon, ref_equity)
         sims[key] = _scatter(sm, sel, nc)
     say(f"simulated {len(groups)} exit configuration(s) on {nc} candidate events")
+    base_sim = sims[_exit_key(s)]
+    n_invalid = int(base_sim.invalid[cand_of[BASELINE]].sum())
+    n_refused = int(base_sim.refused[cand_of[BASELINE]].sum())
+    if n_invalid:
+        bad_ix = np.nonzero(base_sim.invalid & cand_of[BASELINE])[0][:5]
+        where = ", ".join(f"{g.syms[j[i]]} {cal[t0[i]].date()}" for i in bad_ix)
+        warnings.append(
+            f"DATA PROBLEM: {n_invalid} baseline signal(s) could not be traded because of a "
+            f"zero or missing price on the entry bar (first: {where}). They were dropped; "
+            "fix the data, because the same bad bar may distort other results")
+        if n_invalid > 0.05 * max(int(cand_of[BASELINE].sum()), 1):
+            raise StudyError(f"{n_invalid} of {int(cand_of[BASELINE].sum())} signals sit on "
+                             "invalid price bars: the data is not usable, fix it first")
+    if n_refused:
+        warnings.append(
+            f"{n_refused} baseline signal(s) were refused because the round trip costs more "
+            f"than max_cost_r={s.max_cost_r:g} R at the reference size of "
+            f"{ref_equity:,.0f} EUR (use --ref-equity with the equity you really trade)")
 
     limit = g.A["close"][t0, j] * (1 + s.max_entry_gap)
     sp_base = np.array([stop_distance_pct(float(pp), float(aa), s)
@@ -1327,10 +1619,14 @@ def run_study(bars: dict[str, pd.DataFrame], s, vix: pd.Series | None = None,
         if not p.allow_overlap:
             member = one_position_per_symbol(order, j, t0, sm.exit_t, member)
         ix = np.nonzero(member)[0]
+        rref = sm.net_ret[ix] / sp_base[ix]
+        rx = rref
+        if p.drift_adjust and len(ix):
+            rx = (sm.net_ret[ix] - mm.drift(t0[ix], j[ix], sm.exit_t[ix])) / sp_base[ix]
         return EventSet(name=name, t0=t0[ix], j=j[ix], exit_t=sm.exit_t[ix],
-                        R=sm.net_ret[ix] / sm.sp[ix], Rref=sm.net_ret[ix] / sp_base[ix],
+                        R=sm.net_ret[ix] / sm.sp[ix], Rref=rref,
                         eq=sm.weight[ix] * sm.net_ret[ix] * 100.0, score=feats["score"][ix],
-                        held=sm.held[ix], reason=sm.reason[ix])
+                        held=sm.held[ix], reason=sm.reason[ix], Rx=rx)
 
     sets = {name: make_set(name) for name in names}
     base = sets[BASELINE]
@@ -1363,7 +1659,8 @@ def run_study(bars: dict[str, pd.DataFrame], s, vix: pd.Series | None = None,
     if n_locked < p.min_locked_events:
         warnings.append(
             f"the LOCKED segment has only {n_locked} baseline events (< {p.min_locked_events}): "
-            "a confirmation there is weak, treat any adoption as provisional")
+            "too few to confirm anything, so no variant will be evaluated there and nothing "
+            "will be recommended")
 
     # ---- DESIGN: statistics, then selection ---------------------------------------------
     say("design segment: paired block bootstrap...")
@@ -1374,29 +1671,31 @@ def run_study(bars: dict[str, pd.DataFrame], s, vix: pd.Series | None = None,
     if n_design < p.min_design_events:
         selected = []
         table["design_pass"] = False
+        table["coverage_only"] = False
 
     # ---- LOCKED: only the selected variants, once ---------------------------------------
     locked_tbl = pd.DataFrame()
     final: list[str] = []
-    if selected:
+    locked_blocked = bool(selected) and n_locked < p.min_locked_events
+    if locked_blocked:
+        # too few locked events to confirm anything: do not even look at them (a confirmation
+        # with no power only invites a false recommendation)
+        say(f"locked segment too small ({n_locked} events): not evaluated, no recommendation")
+    elif selected:
         say(f"locked segment: evaluating {len(selected)} selected variant(s) once...")
         lsets = {nm: locked_all[nm] for nm in [BASELINE] + selected}
-        locked_tbl = analyse_segment(lsets, cald, L, b, None, p, p.seed + 1)
-        ratios, oks = {}, {}
-        for nm in selected:
-            r = locked_tbl.loc[nm]
-            dd = table.at[nm, "dR"]
-            oks[nm] = bool(r["dR"] > 0 and r["dR"] >= p.magnitude_min * dd)
-            ratios[nm] = float(r["dR"] / dd) if dd else float("nan")
-            if oks[nm]:
-                final.append(nm)
+        # Holm over the selected variants: the confirmation is a real one-sided test, not
+        # only "same sign and half of the size"
+        locked_tbl = analyse_segment(lsets, cald, L, b, [selected], p, p.seed + 1)
+        final, ratios, p1s, oks = confirm_locked(locked_tbl, table, selected, p)
         locked_tbl["locked_ratio"] = pd.Series(ratios, dtype=float)
+        locked_tbl["locked_p_one_sided"] = pd.Series(p1s, dtype=float)
         locked_tbl["locked_pass"] = pd.Series(oks, dtype=object)
 
     # ---- placebo --------------------------------------------------------------------------
     say("random-entry placebo...")
     placebo = _run_placebo(g, s, on, off, mask_days, base, design_sets[BASELINE], cald, L, p,
-                           ref_equity)
+                           ref_equity, mm, a, b)
 
     # ---- baseline numbers, events table, meta ----------------------------------------------
     per_year = _per_year(base, cald)
@@ -1406,7 +1705,7 @@ def run_study(bars: dict[str, pd.DataFrame], s, vix: pd.Series | None = None,
     d_eff = (effective_n(design_sets[BASELINE].R, cald.wk[design_sets[BASELINE].t0])
              if n_design else (0.0, 0.0, 1.0))
     baseline = {
-        "raw_signals": int(base_sig.sum()), "events": base.n, "win_rate": bperf["win"],
+        "raw_signals": raw_signals, "events": base.n, "win_rate": bperf["win"],
         "avg_R": bperf["avg"], "median_R": float(np.median(base.R)) if base.n else np.nan,
         "payoff": bperf["payoff"], "profit_factor": bperf["pf"],
         "median_hold_sessions": float(np.median(base.held)) if base.n else np.nan,
@@ -1438,9 +1737,18 @@ def run_study(bars: dict[str, pd.DataFrame], s, vix: pd.Series | None = None,
         "fee_preset": s.fee_preset or s.broker, "alpha": p.alpha,
         "id_cutoffs": {f"{k:.0%}": v for k, v in id_cutoffs.items()},
         "overridden_settings": _overridden(s),
+        "metric": ("R net of beta x the equal-weight universe return over each holding window"
+                   if p.drift_adjust else "raw R"),
+        "universe_cagr": mm.cagr, "vix": vix_note, "vix_status": vix_note["status"],
+        "refused_by_cost": n_refused, "locked_blocked": locked_blocked,
+        "min_gain_r": p.min_gain_r, "min_changed_events": p.min_changed_events,
+        "min_locked_events": p.min_locked_events,
+        "live_fee_preset": p.live_fee_preset,
+        "coverage_only": [n for n in tests if bool(table.at[n, "coverage_only"])],
     }
-    final_sorted = sorted(final, key=lambda n: -table.at[n, "dR"])
-    recommended = final_sorted[:1]
+    # the most conservative gain first: what held in BOTH the design and the locked years
+    final_sorted = sorted(final, key=lambda n: -min(table.at[n, "dR"], locked_tbl.at[n, "dR"]))
+    recommended = [] if p.vix_failed else final_sorted[:1]
     env = env_for(vmap[recommended[0]]) if recommended else {}
     verdict, verdict_fr = _verdict(meta, baseline, placebo, table, locked_tbl, selected,
                                    final_sorted, recommended, vmap, n_locked, p)
@@ -1450,6 +1758,29 @@ def run_study(bars: dict[str, pd.DataFrame], s, vix: pd.Series | None = None,
                        recommended=recommended, env=env, verdict=verdict,
                        verdict_fr=verdict_fr, warnings=warnings, events=events_df,
                        variants_table=vt, audit=audit, checks=checks)
+
+
+def confirm_locked(locked: pd.DataFrame, design: pd.DataFrame, selected: Sequence[str],
+                   p: Params) -> tuple[list[str], dict, dict, dict]:
+    """The locked-years test of the selected variants: (passed, ratio, one-sided p, ok).
+
+    A variant is confirmed if its locked difference has the same sign, is at least
+    ``magnitude_min`` of the design difference AND is significant: one-sided p-value
+    (Holm over the selected variants, the larger of the 1-week and 4-week block versions)
+    at most ``alpha``.  "Same sign and half the size" alone passed a quarter of the design
+    false positives."""
+    passed, ratios, p1s, oks = [], {}, {}, {}
+    for nm in selected:
+        r = locked.loc[nm]
+        dd = design.at[nm, "dR"]
+        p1 = float(max(r["p_holm"], r["p_holm_blk"]) / 2)  # two-sided -> one-sided
+        p1s[nm] = p1
+        oks[nm] = bool(r["dR"] > 0 and r["dR"] >= p.magnitude_min * dd
+                       and np.isfinite(p1) and p1 <= p.alpha)
+        ratios[nm] = float(r["dR"] / dd) if dd else float("nan")
+        if oks[nm]:
+            passed.append(nm)
+    return passed, ratios, p1s, oks
 
 
 def _audit_days(m: np.ndarray, on: np.ndarray, days: list[int], rng, p: Params) -> list[int]:
@@ -1471,38 +1802,65 @@ def _scatter(sm: Sim, sel: np.ndarray, n: int) -> Sim:
                fill=np.full(n, np.nan), sp=np.full(n, np.nan),
                exit_t=np.full(n, -1, dtype=np.int64), exit_px=np.full(n, np.nan),
                reason=np.full(n, "", dtype=object), held=np.zeros(n, dtype=np.int64),
-               net_ret=np.full(n, np.nan), weight=np.full(n, np.nan))
+               net_ret=np.full(n, np.nan), weight=np.full(n, np.nan),
+               refused=np.zeros(n, dtype=bool), invalid=np.zeros(n, dtype=bool))
     for f_ in fields(Sim):
         getattr(full, f_.name)[sel] = getattr(sm, f_.name)
     return full
 
 
-def _run_placebo(g, s, on, off, mask_days, base, design_base, cald, L, p, ref_equity) -> dict:
+def _run_placebo(g, s, on, off, mask_days, base, design_base, cald, L, p, ref_equity, mm,
+                 a, b) -> dict:
+    """Random entries with the same exits and costs, drawn among the stocks the 7/7 signal
+    itself starts from: eligible, regime on, in the entry top ``top_pct_entry`` of the
+    momentum ranking with a positive score (the first of the seven conditions).  Entries
+    drawn from ALL stocks are mostly low-ranked names that the weekly rank exit sells within
+    a few sessions, so against them the signal would only show that it is held longer.
+
+    The pool is thinned per segment, so the design numbers never depend on how many stock
+    days the locked years contain."""
     if p.placebo_draws <= 0:
         return {}
-    pool_ok = g.eligible & on[:, None] & mask_days[:, None]
+    A = g.A
+    with np.errstate(invalid="ignore"):
+        band = (A["pct_rank"] >= 1 - s.top_pct_entry) & (A["score"] > 0)
+    pool_ok = g.eligible & on[:, None] & mask_days[:, None] & band
     pool_ok[g.T - 1] = False
-    pt, pj = np.nonzero(pool_ok)
-    if len(pt) > p.placebo_pool:
-        pick = np.random.default_rng(p.seed + 3).choice(len(pt), p.placebo_pool, replace=False)
-        pt, pj = pt[pick], pj[pick]
+    picks = []
+    for k, (lo, hi) in enumerate(((0, L), (L, g.T))):
+        seg = np.zeros_like(pool_ok)
+        seg[lo:hi] = pool_ok[lo:hi]
+        pt, pj = np.nonzero(seg)
+        if len(pt) > p.placebo_pool:
+            pick = np.random.default_rng(p.seed + 3 + k).choice(len(pt), p.placebo_pool,
+                                                                replace=False)
+            pt, pj = pt[pick], pj[pick]
+        picks.append((pt, pj))
+    pt = np.concatenate([x[0] for x in picks]).astype(np.int64)
+    pj = np.concatenate([x[1] for x in picks]).astype(np.int64)
     if not len(pt):
         return {}
-    psm = simulate(g, pt.astype(np.int64), pj.astype(np.int64), s, off, p.horizon, ref_equity)
+    psm = simulate(g, pt, pj, s, off, p.horizon, ref_equity)
     fi = np.nonzero(psm.filled)[0]
+    if not len(fi):
+        return {}
     r_own = psm.net_ret[fi] / psm.sp[fi]
+    x_own = r_own
+    if p.drift_adjust:
+        x_own = (psm.net_ret[fi] - mm.drift(pt[fi], pj[fi], psm.exit_t[fi])) / psm.sp[fi]
     pool_all = EventSet("placebo", pt[fi], pj[fi], psm.exit_t[fi], r_own, r_own,
                         psm.weight[fi] * psm.net_ret[fi] * 100, np.zeros(len(fi)),
-                        psm.held[fi], psm.reason[fi])
+                        psm.held[fi], psm.reason[fi], x_own)
     pool_design = pool_all.sel((pool_all.t0 < L) & (pool_all.exit_t < L))
+    # the baseline in its own R (against its own stop), as the pool: baseline.R == Rref
     return {
-        "all": placebo_summary(pool_all, base, cald, p.placebo_draws, p.seed + 11, False),
+        "all": placebo_summary(pool_all, base, cald, p.placebo_draws, p.seed + 11, False, a, b),
         "all_by_year": placebo_summary(pool_all, base, cald, p.placebo_draws, p.seed + 12,
-                                       True),
+                                       True, a, b),
         "design": placebo_summary(pool_design, design_base, cald, p.placebo_draws,
-                                  p.seed + 13, False),
+                                  p.seed + 13, False, a, L),
         "design_by_year": placebo_summary(pool_design, design_base, cald, p.placebo_draws,
-                                          p.seed + 14, True),
+                                          p.seed + 14, True, a, L),
     }
 
 
@@ -1558,19 +1916,23 @@ def _events_frame(g: Grid, t0, j, feats, sm: Sim, in_base, base: EventSet, L: in
     for k in ("score", "pct_rank", "rsi", "vol_ratio", "h52", "ext50", "atr_pct",
               "ext_ema20_atr", "gap_atr", "id_smooth", "event_bar_1", "event_bar_3",
               "event_bar_5"):
-        df[k] = feats[k][idx]
+        # the entry-quality features of the LOCKED rows stay empty: with them (and R) anyone
+        # could rebuild the locked mean of any variant that was not selected, and the locked
+        # years would no longer be a single, untouched confirmation
+        df[k] = pd.Series(feats[k][idx]).where(seg[idx] != "locked").to_numpy()
     return df.reset_index(drop=True)
 
 
 _FIRST_COLS = [
     "family", "expect", "role", "overrides", "filter", "n", "keep", "win_rate", "avg_R",
-    "median_R", "avg_R_ref", "avg_eq_pct", "payoff", "profit_factor", "median_hold", "dR",
-    "dR_lo", "dR_hi", "p_raw", "p_holm", "p_raw_blk", "p_holm_blk", "dR_lo_blk", "dR_hi_blk",
+    "median_R", "avg_R_ref", "avg_R_x", "avg_eq_pct", "payoff", "profit_factor",
+    "median_hold", "dR", "dR_lo", "dR_hi", "dR_raw", "n_changed", "p_raw", "p_holm",
+    "p_raw_blk", "p_holm_blk", "dR_lo_blk", "dR_hi_blk",
     "ci_adj_lo", "ci_adj_hi", "d_eq", "d_eq_lo", "d_eq_hi", "d_dec", "d_dec_lo", "d_dec_hi",
     "n_dec", "d_day", "years_used", "years_same_sign", "year_share", "year_diffs", "loyo_min",
     "plateau", "plateau_note", "n_eff", "icc", "events_per_week", "justified", "c_sign",
-    "c_holm", "c_years", "c_plateau", "c_keep", "c_decl", "c_eq", "design_pass",
-    "selected_on_design"]
+    "c_holm", "c_size", "c_years", "c_plateau", "c_keep", "c_decl", "c_eq", "design_pass",
+    "coverage_only", "selected_on_design"]
 
 
 def _variants_frame(variants, table, locked, selected, final, placebo) -> pd.DataFrame:
@@ -1593,6 +1955,7 @@ def _variants_frame(variants, table, locked, selected, final, placebo) -> pd.Dat
             lr = locked.loc[nm]
             r.update({"locked_n": lr["n"], "locked_dR": lr["dR"], "locked_ci_lo": lr["dR_lo"],
                       "locked_ci_hi": lr["dR_hi"], "locked_ratio": lr["locked_ratio"],
+                      "locked_p_one_sided": lr["locked_p_one_sided"],
                       "locked_pass": bool(lr["locked_pass"])})
         r["final_pass"] = nm in final
         r["year_diffs"] = ";".join(f"{x:+.3f}" for x in r["year_diffs"])
@@ -1603,13 +1966,12 @@ def _variants_frame(variants, table, locked, selected, final, placebo) -> pd.Dat
         rows.append({
             "variant": "random_entries (placebo)", "family": "placebo", "expect": "worse",
             "role": "placebo", "n": pl["events"], "avg_R": pl["random_avg_R_mean"],
-            "dR": pl["random_avg_R_mean"] - pl["baseline_avg_R"],
-            "dR_lo": pl["random_avg_R_p5"] - pl["baseline_avg_R"],
-            "dR_hi": pl["random_avg_R_p95"] - pl["baseline_avg_R"],
+            "dR": -pl["diff"], "dR_lo": -pl["diff_hi"], "dR_hi": -pl["diff_lo"],
             "p_raw": pl["p_value_one_sided"], "keep": pl["events"] / base_row["n"],
-            "why": "random eligible stock-days, same count, exits and costs; dR = random "
-                   "minus baseline (5%-95% of the draws); p_raw = share of draws at least as "
-                   "good as the baseline",
+            "why": "random entries among the top-ranked, regime-on stocks (same exits, costs "
+                   "and market adjustment, years weighted like the baseline); dR = random "
+                   "minus baseline with a 95% interval from resampling whole weeks; p_raw = "
+                   "one-sided p that the baseline is NOT better",
             "selected_on_design": False, "final_pass": False})
     df = pd.DataFrame(rows).set_index("variant")
     rest = [c for c in df.columns if c not in _FIRST_COLS]
@@ -1635,61 +1997,124 @@ def _verdict(meta, baseline, placebo, table, locked, selected, final, recommende
     fam = meta["family_size"]
     dy, ly = _years_text(meta["design_years"]), _years_text(meta["locked_years"])
     pl = placebo.get("design_by_year") or placebo.get("design") or {}
+    cagr = meta.get("universe_cagr", float("nan"))
     notes = []
-    if pl.get("draws"):
-        pct = pl["baseline_percentile"]
-        notes.append(f"On the design years the 7/7 signal beat {pct:.0f}% of the random-entry "
-                     "draws (same exits and costs)"
-                     + ("." if pct >= 90 else
-                        ": that is not clearly better than picking stocks at random, so the "
-                        "entry signal itself is not proven."))
+    if pl.get("draws") and np.isfinite(pl.get("p_value_one_sided", np.nan)):
+        better = pl["p_value_one_sided"] <= p.alpha
+        notes.append(
+            "Against random entries among the same top-ranked momentum stocks (same exits, "
+            f"costs and market adjustment) the 7/7 signal earned {pl['diff']:+.2f} R more per "
+            f"trade on the design years (one-sided p {pl['p_value_one_sided']:.3f})"
+            + ("." if better else
+               ": the entry signal is not shown to beat a random pick among top-ranked stocks, "
+               "so it is not proven."))
     if np.isfinite(baseline.get("design_avg_R", np.nan)) and baseline["design_avg_R"] <= 0:
         notes.append("The baseline loses money (net of costs) on the design years.")
-    if n_locked < p.min_locked_events:
-        notes.append("The locked segment is small, so any conclusion is provisional.")
+    if np.isfinite(cagr) and cagr > DRIFT_WARN:
+        notes.append(f"The equal-weight universe grew {cagr:.0%} a year in this sample: every "
+                     "result is measured net of that drift, but a longer hold (wider stop or "
+                     "trail) is the first thing a bull market flatters.")
+    if meta.get("vix_status") == "off":
+        notes.append("The regime had no VIX gates in this study (SPY trend only).")
     tail = (" " + " ".join(notes)) if notes else ""
+    cov = meta.get("coverage_only") or []
+    cov_note = (f" {len(cov)} other variant(s) passed every test except coverage ({', '.join(cov)})"
+                ": they look better on the design years but keep too few events to fill the "
+                "slots, so they are not adoptable (a fact about the signal, not a setting to "
+                "change)." if cov else "")
     if baseline["design_events"] < p.min_design_events:
+        refused = meta.get("refused_by_cost", 0)
+        why = (f" {refused} signal(s) were refused because the round trip costs more than "
+               f"max_cost_r at the reference size {meta.get('ref_equity_eur', 0):,.0f} EUR: "
+               "use --ref-equity with the equity you really trade." if refused else "")
         text = (f"NO CONCLUSION: the design years {dy} hold only {baseline['design_events']} "
                 f"events (at least {p.min_design_events} are needed), so nothing can be "
-                f"selected. Keep the defaults and use more history or more stocks.{tail}")
+                f"selected.{why} Keep the defaults and use more history or more stocks.{tail}")
         fr = ("PAS DE CONCLUSION : trop peu d'événements sur les années de conception. "
               "Garder les réglages par défaut.")
         return text, fr
+    if meta.get("vix_status") == "unavailable":
+        text = (f"NO CONCLUSION: VIX / VIX3M could not be loaded, so the market regime differs "
+                "from the live bot's and the events are not the ones it would trade. Nothing is "
+                "recommended. Fix the connection and run again, or pass --no-vix to accept a "
+                f"SPY-only regime on purpose.{tail}")
+        fr = ("PAS DE CONCLUSION : VIX/VIX3M indisponibles, le régime ne correspond pas à celui "
+              "du bot. Garder les réglages par défaut.")
+        return text, fr
+    blocked = meta.get("locked_blocked") or (bool(selected) and n_locked < p.min_locked_events)
+    if blocked:
+        text = (f"NO CONCLUSION (PROVISIONAL): {len(selected)} change(s) looked good on the "
+                f"design years {dy} ({', '.join(selected)}) but the locked years {ly} hold only "
+                f"{n_locked} events (at least {p.min_locked_events} are needed to confirm "
+                "anything), so they were not checked and nothing is recommended. Keep the "
+                "defaults; use more history, more stocks or an earlier --locked-from, and "
+                f"re-run.{tail}")
+        fr = ("PAS DE CONCLUSION (PROVISOIRE) : trop peu d'événements sur les années "
+              "verrouillées pour confirmer. Garder les réglages par défaut.")
+        return text, fr
     if recommended:
         nm = recommended[0]
-        env = env_for(vmap[nm])
+        v = vmap[nm]
+        env = env_for(v)
         how = (f"Set {_fmt_env(env)}." if env else
                f"{nm} is a filter that the engine does not have: it needs a code change, there "
                "is no INV_ setting for it.")
+        if v.flt == "gap_atr":
+            how += (" It also uses the NEXT session's open, which does not exist when the "
+                    "limit order is placed at the close: it can only work as a check made at "
+                    "the open, before the order is released.")
+        p1 = locked["locked_p_one_sided"] if "locked_p_one_sided" in locked.columns else None
+        conf = (f", one-sided p {p1.at[nm]:.3f}" if p1 is not None and nm in p1.index else "")
         text = (f"ONE CHANGE IS SUPPORTED: {nm}. {how} It passed every test on the design "
-                f"years {dy} (mean R {table.at[nm, 'dR']:+.2f} above the baseline, corrected "
-                f"p-value {table.at[nm, 'p_holm']:.3f}, same sign in "
-                f"{table.at[nm, 'years_same_sign']} years) and it held on the locked years "
-                f"{ly} ({locked.at[nm, 'dR']:+.2f} R). Change only this one parameter and "
-                f"re-run the study: combinations of changes were not tested.{tail}")
+                f"years {dy} (mean R {table.at[nm, 'dR']:+.2f} above the baseline, measured net "
+                f"of the market's move over each holding window; corrected p-value "
+                f"{table.at[nm, 'p_holm']:.3f}, same sign in "
+                f"{table.at[nm, 'years_same_sign']} years) and it was confirmed on the locked "
+                f"years {ly} ({locked.at[nm, 'dR']:+.2f} R{conf}). Change only this one "
+                f"parameter and re-run the study: combinations of changes were not "
+                f"tested.{tail}")
         fr = (f"UN SEUL CHANGEMENT EST SOUTENU : {nm}. "
               + (f"Régler {_fmt_env(env)}. " if env else
                  "C'est un filtre absent du moteur : il faut modifier le code. ")
-              + "Il passe tous les tests sur les années de conception et tient sur les années "
-                "verrouillées. Ne changer que ce paramètre.")
+              + "Il passe tous les tests sur les années de conception et est confirmé sur les "
+                "années verrouillées. Ne changer que ce paramètre.")
         return text, fr
     if selected:
         text = (f"KEEP THE DEFAULTS. {len(selected)} change(s) looked good on the design years "
-                f"{dy} ({', '.join(selected)}) but none held on the locked years {ly}: the "
-                f"gain vanished or fell under half of its size. That is what luck, or a "
-                f"change of market, looks like.{tail}")
+                f"{dy} ({', '.join(selected)}) but none was confirmed on the locked years "
+                f"{ly}: the gain vanished, fell under half of its size or was not significant. "
+                f"That is what luck, or a change of market, looks like.{cov_note}{tail}")
         fr = ("GARDER LES RÉGLAGES PAR DÉFAUT. Certaines variantes semblaient meilleures sur "
-              "les années de conception, mais aucune ne tient sur les années verrouillées.")
+              "les années de conception, mais aucune n'est confirmée sur les années "
+              "verrouillées.")
         return text, fr
     text = (f"KEEP THE DEFAULTS. {meta['variants_declared']} variants were written down before "
             f"looking at any result, {fam} of them as possible improvements. None of those "
             f"passed all the tests on the design years {dy} once we account for having tried "
             f"{fam} ideas at once, so there is no honest reason to change a parameter. No "
-            f"variant was looked at on the locked years {ly}.{tail}")
+            f"variant was looked at on the locked years {ly}.{cov_note}{tail}")
     fr = ("GARDER LES RÉGLAGES PAR DÉFAUT. Aucune des variantes déclarées à l'avance ne passe "
           "tous les tests sur les années de conception : rien ne justifie de changer un "
           "paramètre.")
     return text, fr
+
+
+def _pct(x) -> str:
+    return "n/a" if x is None or not np.isfinite(x) else f"{x:.1%}"
+
+
+def _vix_line(m: Mapping) -> str:
+    v = m.get("vix") or {}
+    status = m.get("vix_status", "off")
+    if status == "loaded":
+        span = v.get("vix") or {}
+        v3 = v.get("vix3m") or {}
+        return (f"SPY trend plus the VIX gates (VIX from FRED {span.get('first')} to "
+                f"{span.get('last')}" + (f", VIX3M {v3.get('first')} to {v3.get('last')}"
+                                         if v3 else ", VIX3M MISSING") + ").")
+    if status == "unavailable":
+        return "VIX / VIX3M could NOT be loaded: no VIX gates, so no recommendation is made."
+    return "SPY trend only, VIX / VIX3M not used (--no-vix or none supplied)."
 
 
 def _f(x, nd=2, sign=False) -> str:
@@ -1713,12 +2138,17 @@ def _why_not(r, alpha: float) -> str:
         return "no clear difference: default not shown to help"
     if r["design_pass"]:
         return "PASS on design"
+    cov_only = r.get("coverage_only", False)
+    if isinstance(cov_only, (bool, np.bool_)) and cov_only:
+        return (f"real on the design years, but keeps only {r['keep']:.0%} of the events: the "
+                "slots would sit idle (not adoptable)")
     for key, text in (("c_sign", "not higher"), ("c_holm", f"p(Holm) > {alpha:g}"),
+                      ("c_size", "gain under the minimum or too few events changed"),
                       ("c_years", "unstable across years (or one year carries it)"),
                       ("c_plateau", f"plateau: {r['plateau']}"), ("c_keep", "keeps too few events"),
                       ("c_decl", "fails when de-clustered"),
                       ("c_eq", "equity contribution not higher")):
-        if not r[key]:
+        if key in r and not r[key]:
             return text
     return "-"
 
@@ -1739,9 +2169,13 @@ def render_report(res: StudyResult) -> str:
             "dozen real trades.",
             "- R = profit divided by the money risked at entry (entry price minus first stop), "
             "after fees and slippage. +1 R means a gain equal to the initial risk.",
-            "- 'dR' = the average R of a variant minus the average R of the baseline. A bigger "
-            "average alone proves nothing: a variant counts only if it passes every test of "
-            "the decision rule at the bottom of this page.",
+            "- 'dR' = the average R of a variant minus the average R of the baseline, where "
+            "every trade's R is first reduced by the market's move over its holding window "
+            "(beta x the equal-weight universe return from the signal to the exit). Without "
+            "that, a wider stop or trail would win in any rising market just by keeping the "
+            "money invested longer. 'raw dR' is the same difference without the adjustment. A "
+            "bigger average alone proves nothing: a variant counts only if it passes every "
+            "test of the decision rule at the bottom of this page.",
             "- The 95% interval comes from resampling whole weeks (events of the same week "
             "move together). The p-value is corrected for having tried "
             f"{m['family_size']} ideas at once ({m['correction']}).", ""]
@@ -1762,7 +2196,21 @@ def render_report(res: StudyResult) -> str:
             f"Bootstrap: {m['n_boot']} resamples of whole weeks, seed {m['seed']}.",
             "- For a variant with another stop distance, R is measured against the "
             "BASELINE initial risk, so that a wider stop does not look better only because "
-            "its unit is bigger."]
+            "its unit is bigger.",
+            f"- Decision metric: {m.get('metric', 'raw R')}. The equal-weight universe grew "
+            f"{_pct(m.get('universe_cagr'))} a year over the analysed years.",
+            f"- Regime: {_vix_line(m)}",
+            f"- Costs: fee preset '{m['fee_preset']}', reference equity "
+            f"{m['ref_equity_eur']:,.0f} EUR."
+            + (f" Your live broker uses '{m['live_fee_preset']}': set INV_FEE_PRESET="
+               f"{m['live_fee_preset']} to cost the trades like your live broker."
+               if m.get("live_fee_preset") else ""),
+            f"- A variant must also gain at least {m.get('min_gain_r', 0.05):g} R and change "
+            f"at least {m.get('min_changed_events', 30)} events (a bootstrap that rests on a "
+            "handful of events is unreliable), and the locked years need at least "
+            f"{m.get('min_locked_events', 150)} events to confirm anything.",
+            "- events.csv: the entry-quality columns of the locked-year rows are left empty on "
+            "purpose, so that the locked years stay a single untouched confirmation."]
     if m["overridden_settings"]:
         out += [f"- The baseline is YOUR configuration. Settings that differ from the code "
                 f"defaults: {m['overridden_settings']}"]
@@ -1788,26 +2236,35 @@ def render_report(res: StudyResult) -> str:
     out += ["", "Exits of the baseline events: " + ", ".join(
         f"{k} {v}" for k, v in b["exit_mix"].items()), ""]
     out += ["## Random-entry placebo", ""]
-    for key, label in (("design_by_year", "design years, same number of entries per year"),
+    for key, label in (("design_by_year", "design years, years weighted like the baseline"),
                        ("design", "design years"),
-                       ("all_by_year", "all years, same number of entries per year"),
-                       ("all", "all years")):
+                       ("all_by_year", "INFORMATION ONLY, includes the locked years, years "
+                                       "weighted like the baseline"),
+                       ("all", "INFORMATION ONLY, includes the locked years")):
         pl = res.placebo.get(key)
         if pl and pl.get("draws"):
-            out.append(f"- {label}: baseline average R {_f(pl['baseline_avg_R'], 3, True)}, "
-                       f"random entries {_f(pl['random_avg_R_mean'], 3, True)} (5% to 95% of "
-                       f"the draws: {_f(pl['random_avg_R_p5'], 3, True)} to "
-                       f"{_f(pl['random_avg_R_p95'], 3, True)}). The baseline beats "
-                       f"{pl['baseline_percentile']:.0f}% of {pl['draws']} random draws.")
-    out += ["", "Random entries are drawn among eligible stocks while the regime is on, with "
-            "the same exits and costs. Around 50% would mean no better than chance.", ""]
+            out.append(f"- {label}: net of the market, baseline "
+                       f"{_f(pl['baseline_avg_R'], 3, True)} R vs random entries "
+                       f"{_f(pl['random_avg_R_mean'], 3, True)} R, difference "
+                       f"{_f(pl['diff'], 3, True)} R (95% interval "
+                       f"{_f(pl['diff_lo'], 3, True)} to {_f(pl['diff_hi'], 3, True)}, "
+                       f"one-sided p {_f(pl['p_value_one_sided'], 3)}); raw R "
+                       f"{_f(pl['baseline_avg_R_raw'], 3, True)} vs "
+                       f"{_f(pl['random_avg_R_raw'], 3, True)}; mean hold "
+                       f"{_f(pl['baseline_hold'], 1)} vs {_f(pl['random_hold'], 1)} sessions.")
+    out += ["", "Random entries are drawn among the stocks the signal itself starts from "
+            "(eligible, regime on, in the entry top of the momentum ranking), with the same "
+            "exits, costs and market adjustment, so the comparison is about the 7/7 timing and "
+            "not about holding time. The interval resamples whole weeks for both sides; a "
+            "p-value above 0.05 means the signal is not shown to beat a random pick among "
+            "top-ranked stocks.", ""]
     out += ["## Variants on the design years", "",
             "'keep' = share of the baseline events that remain. 'years' = design years where "
             "the difference has the right sign. 'decl.' = the difference when only the best "
             "scored event of each week is kept.", "",
-            "| variant | hypothesis | n | keep | avg R | dR | 95% interval | p (Holm) | "
-            "p (Holm, 4-week blocks) | years | decl. | result |",
-            "|---|---|---|---|---|---|---|---|---|---|---|---|"]
+            "| variant | hypothesis | n | keep | avg R | dR | raw dR | 95% interval | p (Holm) "
+            "| p (Holm, 4-week blocks) | years | decl. | result |",
+            "|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
     tb = res.variants_table
     for nm, r in tb.iterrows():
         if r["role"] not in ("test", "control"):
@@ -1816,6 +2273,7 @@ def render_report(res: StudyResult) -> str:
         out.append(
             f"| {nm} | {r['expect']} | {int(r['n'])} | {_f(r['keep'], 2)} | "
             f"{_f(r['avg_R'], 3, True)} | {_f(r['dR'], 3, True)} | "
+            f"{_f(r['dR_raw'], 3, True)} | "
             f"[{_f(r['dR_lo'], 3, True)}, {_f(r['dR_hi'], 3, True)}] | "
             f"{_f(r['p_holm'], 3) if tested else '-'} | "
             f"{_f(r['p_holm_blk'], 3) if tested else '-'} | "
@@ -1824,15 +2282,23 @@ def render_report(res: StudyResult) -> str:
     out += ["", "## Locked years: selected variants only", ""]
     if len(res.locked):
         out += ["| variant | design dR | locked events | locked dR | locked 95% interval | "
-                "locked / design | held? |", "|---|---|---|---|---|---|---|"]
+                "locked / design | one-sided p (Holm) | held? |",
+                "|---|---|---|---|---|---|---|---|"]
         for nm in res.selected:
             r = res.locked.loc[nm]
             out.append(f"| {nm} | {_f(res.design.at[nm, 'dR'], 3, True)} | {int(r['n'])} | "
                        f"{_f(r['dR'], 3, True)} | [{_f(r['dR_lo'], 3, True)}, "
                        f"{_f(r['dR_hi'], 3, True)}] | {_f(r['locked_ratio'], 2)} | "
+                       f"{_f(r['locked_p_one_sided'], 3)} | "
                        f"{'yes' if r['locked_pass'] else 'no'} |")
-        out += ["", "A variant holds if its locked difference has the same sign and is at "
-                "least half of the design difference."]
+        out += ["", "A variant holds if its locked difference has the same sign, is at least "
+                "half of the design difference AND is significant: the one-sided p-value "
+                "(Holm-corrected over the selected variants, for 1-week and 4-week blocks) "
+                f"is at most {m['alpha']:g}."]
+    elif m.get("locked_blocked"):
+        out.append(f"The locked years hold fewer than {m.get('min_locked_events', 150)} events, "
+                   "too few to confirm anything: the selected variants were NOT evaluated "
+                   "there and nothing is recommended.")
     else:
         out.append("No variant passed on the design years, so no variant was evaluated on "
                    "the locked years.")
@@ -1897,6 +2363,130 @@ def write_outputs(res: StudyResult, out_dir: str | Path) -> None:
 # ==================================================================================
 # command line
 # ==================================================================================
+STALE_OK_DAYS = 7  # a cached series whose last bar is this recent is good enough for a study
+
+
+def _iso_date(text: str) -> str:
+    try:
+        return str(date.fromisoformat(text))
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{text!r} is not a date: use YYYY-MM-DD") from None
+
+
+def _number(kind, lo=None, hi=None, what=""):
+    """argparse type: a number in [lo, hi] (an unusable value is refused before any work)."""
+
+    def conv(text: str):
+        try:
+            x = kind(text)
+        except ValueError:
+            raise argparse.ArgumentTypeError(f"{text!r} is not a valid number") from None
+        if (lo is not None and x < lo) or (hi is not None and x > hi) or x != x:
+            raise argparse.ArgumentTypeError(f"{text} is out of range ({what})")
+        return x
+
+    return conv
+
+
+def _frac(text: str) -> float:
+    x = _number(float)(text)
+    if not 0.0 < x < 1.0:
+        raise argparse.ArgumentTypeError(f"{text} must be strictly between 0 and 1")
+    return x
+
+
+def _last_session(today: date) -> date:
+    """Latest session whose bars are normally published: the previous trading day."""
+    d = today - timedelta(days=1)
+    while not is_trading_day(d):
+        d -= timedelta(days=1)
+    return d
+
+
+class _SkipUnknown:
+    """Wrap a bar provider for a multi-hour download: a symbol the provider does not know
+    (HTTP 404) is skipped with a warning instead of stopping the run, and every other
+    provider error names the symbol it happened on."""
+
+    def __init__(self, provider):
+        self._p = provider
+        self.skipped: list[str] = []
+
+    def __getattr__(self, name):
+        return getattr(self._p, name)
+
+    def history(self, symbol, start, end):
+        try:
+            return self._p.history(symbol, start, end)
+        except DataError as exc:
+            if "HTTP 404" in str(exc):
+                log.warning("%s is not known to %s (HTTP 404): skipped", symbol, self._p.name)
+                self.skipped.append(symbol)
+                return empty_frame()
+            raise DataError(f"{symbol}: {exc}") from exc
+
+    def history_many(self, symbols, start, end):
+        if getattr(self._p, "batch_size", 1) <= 1:
+            return {sym: self.history(sym, start, end) for sym in symbols}
+        try:
+            return self._p.history_many(symbols, start, end)
+        except DataError as exc:
+            raise DataError(f"{', '.join(symbols[:3])}...: {exc}") from exc
+
+
+def _download(args, s, symbols: list[str]) -> dict[str, pd.DataFrame]:
+    """Bars from a provider, cached in the study's own folder (the bot's refresh would cut
+    the cache of the bot to its own short history) and only what is missing is requested."""
+    provider = _SkipUnknown(make_provider(s))
+    store = BarStore(args.data_dir, provider, args.days)
+    end = _last_session(date.today())
+    first_ok = end - timedelta(days=args.days) + timedelta(days=10)
+    cached = {sym: store.load(sym) for sym in symbols}
+    cache = Path(args.data_dir) / "bars"
+    # a stock that listed after the start of the window has a short history for good: once
+    # its full history was requested it is not downloaded again on every run
+    marker = cache / "study_full_history.json"
+    done: dict = {}
+    with contextlib.suppress(OSError, ValueError):
+        done = json.loads(marker.read_text())
+    full = {x for x, since in done.items() if isinstance(since, str) and since <= str(first_ok)}
+    missing = [x for x, df in cached.items()
+               if df.empty or (df.index[0].date() > first_ok and x not in full)]
+    stale = [x for x, df in cached.items() if x not in missing
+             and df.index[-1].date() < end - timedelta(days=STALE_OK_DAYS)]
+    need = missing + stale
+    if not need:
+        log.info("price cache %s is complete and recent: no download", cache)
+        return cached
+    step = max(1, getattr(provider, "batch_size", 1))
+    requests_n = -(-len(missing) // step) + -(-len(stale) // step)
+    interval = getattr(getattr(provider, "limiter", None), "interval", 0.0)
+    eta = requests_n * interval
+    log.info("to download from %s: %d symbol(s) with no or short history, %d to refresh "
+             "(%d request(s)%s). Each symbol is saved as it arrives: you can stop and run the "
+             "same command again to resume. Offline re-runs: --csv-dir %s", provider.name,
+             len(missing), len(stale), requests_n,
+             f", about {eta / 3600:.1f} h at the provider's rate limit" if eta >= 60 else "",
+             cache)
+    bars = dict(cached)
+    bars.update(store.update(need, end))
+    for x in missing:
+        if x in bars and not bars[x].empty:
+            done[x] = str(first_ok)
+    with contextlib.suppress(OSError):
+        marker.write_text(json.dumps(done, indent=1))
+    if provider.skipped:
+        log.warning("%d symbol(s) unknown to the provider and skipped: %s. Add them to "
+                    "INV_EXCLUDE to stop asking for them", len(provider.skipped),
+                    ", ".join(provider.skipped))
+    return bars
+
+
+def _stop(message: str) -> int:
+    print(f"STUDY STOPPED: {message}", file=sys.stderr)
+    return 2
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(
         description="Signal-level walk-forward study: which parameters of the bot are robust?")
@@ -1904,66 +2494,116 @@ def main(argv=None) -> int:
                                       "volume)")
     ap.add_argument("--provider", choices=["massive", "alpaca", "tiingo"],
                     help="download bars with this provider (keys from .env)")
-    ap.add_argument("--days", type=int, default=3000, help="calendar days of history to fetch")
-    ap.add_argument("--start", help="first signal day (YYYY-MM-DD)")
-    ap.add_argument("--end", help="last day of data used (YYYY-MM-DD)")
+    ap.add_argument("--days", type=_number(int, 400, 20000, "400 to 20000"), default=3000,
+                    help="calendar days of history to fetch")
+    ap.add_argument("--data-dir", default="data_study",
+                    help="price cache of the study (its own folder: the bot's refresh would "
+                         "truncate a shared one); re-run offline with --csv-dir <dir>/bars")
+    ap.add_argument("--start", type=_iso_date, help="first signal day (YYYY-MM-DD)")
+    ap.add_argument("--end", type=_iso_date, help="last day of data used (YYYY-MM-DD)")
     ap.add_argument("--no-vix", action="store_true", help="do not fetch VIX from FRED")
-    ap.add_argument("--locked-from", type=int, metavar="YYYY",
+    ap.add_argument("--locked-from", type=_number(int, 1990, 2100, "a calendar year"),
+                    metavar="YYYY",
                     help="first calendar year of the LOCKED segment (default: last ~40%%)")
-    ap.add_argument("--design-frac", type=float, default=0.60,
-                    help="share of the calendar years used as DESIGN (default 0.60); the rest "
-                         "is LOCKED")
-    ap.add_argument("--boot", type=int, default=10000, help="bootstrap draws")
-    ap.add_argument("--placebo-draws", type=int, default=2000)
-    ap.add_argument("--horizon", type=int, default=250, help="max sessions a trade is held")
+    ap.add_argument("--design-frac", type=_frac, default=0.60,
+                    help="share of the calendar years used as DESIGN, strictly between 0 and "
+                         "1 (default 0.60); the rest is LOCKED")
+    ap.add_argument("--boot", type=_number(int, 2000, 1_000_000, "at least 2000"),
+                    default=10000, help="bootstrap draws (at least 2000: with fewer, the "
+                                        "smallest corrected p-value cannot reach 0.05)")
+    ap.add_argument("--placebo-draws", type=_number(int, 0, 1_000_000, "0 or more"),
+                    default=2000)
+    ap.add_argument("--horizon", type=_number(int, 2, 5000, "sessions"), default=250,
+                    help="max sessions a trade is held")
     ap.add_argument("--seed", type=int, default=12345)
     ap.add_argument("--allow-overlap", action="store_true",
                     help="count every raw signal even while the symbol is already held")
     ap.add_argument("--audit", choices=["sample", "full", "off"], default="sample",
                     help="check the vectorised signals against evaluate_day")
-    ap.add_argument("--ref-equity", type=float, help="EUR used to size the cost model "
-                                                       "(default: initial capital)")
+    ap.add_argument("--ref-equity", type=_number(float, 1.0, 1e9, "EUR, above 0"),
+                    help="EUR used to size the cost model (default: initial capital)")
     ap.add_argument("--out", default="study_invest")
     ap.add_argument("--env-file", default=".env")
     args = ap.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    if not (args.csv_dir or args.provider):
+        ap.error("give --csv-dir or --provider")
+
+    # the output folder must be writable BEFORE hours of work, not after
+    out = Path(args.out)
+    try:
+        out.mkdir(parents=True, exist_ok=True)
+        probe = out / ".write_test"
+        probe.write_text("ok")
+        probe.unlink()
+    except OSError as exc:
+        ap.error(f"--out {args.out}: cannot write there ({exc})")
 
     overrides: dict = {"broker": "sim"}
     if args.provider:
         overrides["data_provider"] = args.provider
         overrides["history_days"] = args.days
-    s = InvestSettings.from_env(args.env_file, **overrides)
+    try:
+        s = InvestSettings.from_env(args.env_file, **overrides)
+    except (ConfigError, ValueError) as exc:
+        return _stop(f"invalid settings in {args.env_file} / the INV_* variables: {exc}")
+    if args.horizon < max(s.time_stop_days, 5):
+        ap.error(f"--horizon {args.horizon} is shorter than the time stop "
+                 f"({s.time_stop_days} sessions): every trade would be cut by the cap")
+    # the study costs trades with the sim (Trading 212-like) preset unless INV_FEE_PRESET says
+    # otherwise: tell the user when the live broker would cost them differently
+    live_preset = ""
+    try:
+        live = InvestSettings.from_env(args.env_file)
+        if (live.fee_preset or live.broker) != (s.fee_preset or s.broker):
+            live_preset = live.fee_preset or live.broker
+    except (ConfigError, ValueError):
+        pass
     universe = build_universe(s.universe or None, s.exclude)
     symbols = data_symbols(universe, s.benchmark, None)
-    if args.csv_dir:
-        bars = load_csv_dir(args.csv_dir, symbols)
-    elif args.provider:
-        store = BarStore(s.data_dir, make_provider(s), args.days)
-        bars = store.update(symbols, date.today())
-    else:
-        ap.error("give --csv-dir or --provider")
+    try:
+        if args.csv_dir:
+            bars = load_csv_dir(args.csv_dir, symbols)
+        else:
+            bars = _download(args, s, symbols)
+    except DataError as exc:
+        return _stop(f"{exc}. Check the API key in {args.env_file} and the provider's plan")
+    except requests.exceptions.RequestException as exc:
+        return _stop(f"the data provider could not be reached ({exc}). Check the network; "
+                     "what was downloaded is cached and the next run resumes")
+    except (KeyError, ValueError, OSError, pd.errors.ParserError) as exc:
+        return _stop(f"cannot read the price data ({type(exc).__name__}: {exc}). Each file "
+                     "needs date,open,high,low,close,volume columns")
     bars = {k: v for k, v in bars.items() if v is not None and not v.empty}
     if s.benchmark not in bars:
-        raise SystemExit(f"{s.benchmark} bars are required (market regime)")
+        return _stop(f"{s.benchmark} bars are required (market regime)")
     first = min(df.index[0] for df in bars.values()).date()
     vix = vix3m = None
+    vix_failed = False
     if not args.no_vix:
         try:
             vix = fred_series("VIXCLS", first)
             vix3m = fred_series("VXVCLS", first)
+            if vix.empty:
+                raise DataError("FRED returned no VIX data")
         except Exception as exc:
-            log.warning("macro series unavailable (%s): regime uses SPY only", exc)
+            log.warning("macro series unavailable (%s): the study cannot use the VIX gates", exc)
+            vix = vix3m = None
+            vix_failed = True
     params = Params(n_boot=args.boot, seed=args.seed, horizon=args.horizon,
                     design_frac=args.design_frac,
                     locked_from=args.locked_from, placebo_draws=args.placebo_draws,
                     allow_overlap=args.allow_overlap, audit=args.audit,
-                    ref_equity=args.ref_equity, start=args.start, end=args.end)
+                    ref_equity=args.ref_equity, start=args.start, end=args.end,
+                    vix_failed=vix_failed, vix_disabled=args.no_vix,
+                    live_fee_preset=live_preset)
     try:
         res = run_study(bars, s, vix=vix, vix3m=vix3m, params=params)
+        write_outputs(res, args.out)
     except StudyError as exc:
-        print(f"STUDY STOPPED: {exc}", file=sys.stderr)
-        return 2
-    write_outputs(res, args.out)
+        return _stop(str(exc))
+    except OSError as exc:
+        return _stop(f"cannot write the results to {args.out} ({exc})")
     print_console(res, args.out)
     return 0
 
@@ -1983,12 +2623,15 @@ def print_console(res: StudyResult, out_dir) -> None:
     yearly = ", ".join(f"{y}: {_f(r['avg_R'], 2, True)} (n={int(r['events'])})"
                        for y, r in res.per_year.iterrows())
     print(f"  avg R per year    {yearly}")
-    for key in ("design_by_year", "all_by_year"):
-        pl = res.placebo.get(key)
-        if pl and pl.get("draws"):
-            print(f"  placebo ({key}): baseline {_f(pl['baseline_avg_R'], 3, True)} vs random "
-                  f"{_f(pl['random_avg_R_mean'], 3, True)}; beats "
-                  f"{pl['baseline_percentile']:.0f}% of {pl['draws']} draws")
+    pl = res.placebo.get("design_by_year")
+    if pl and pl.get("draws"):
+        print(f"  placebo (design)  baseline {_f(pl['baseline_avg_R'], 3, True)} R vs matched "
+              f"random entries {_f(pl['random_avg_R_mean'], 3, True)} R: difference "
+              f"{_f(pl['diff'], 3, True)} R, one-sided p {_f(pl['p_value_one_sided'], 3)}")
+    cagr = res.meta.get("universe_cagr")
+    if cagr is not None and np.isfinite(cagr):
+        print(f"  universe drift    equal-weight universe {_pct(cagr)} a year "
+              "(results are measured net of it)")
     for w in res.warnings:
         print(f"  WARNING: {w}")
     print(f"\nVERDICT: {res.verdict}")
