@@ -234,7 +234,7 @@ What the audit did change: the backtest could not open a stock for its first two
 | Equal-weight buy & hold of the 132 stocks | +33 %/yr: this is **survivorship bias** (the list is made of today's winners), not skill |
 | The bot as shipped (7/7 breakout, 3 ATR stop, 3 slots) | **-10 % to -28 %**, profit factor 0.8-0.95, 115 stop-outs lost 208 EUR |
 | `invest.study`: does the 7/7 timing beat random entries among the top-ranked stocks? | **No** (difference -0.05 R, p = 0.73). 26 variants tried, none survived the correction |
-| Rank-only entries (regime, top rank, momentum, trend) with 6-10 slots and a 4-6 ATR stop, 12 settings | **bimodal**: +20 % to +40 % in 7 settings, +190 % to +260 % in 5. Years 2019-2023: +11 % to +33 % (SPY: +68 %); the good settings owe it to 2024 (+105 % to +178 %), i.e. to holding a few lucky stocks with a wide enough stop |
+| Rank-only entries (regime, top rank, momentum, trend) with 6-10 slots and a 4-6 ATR stop (9 settings completed) | **bimodal**: +20 % to +42 % in 5 settings, +190 % to +260 % in 4. Years 2019-2023: +11 % to +33 % in all 9 (SPY: +68 %); the good settings owe it to the last three years (+140 % to +178 % over 2024-2026, mostly 2024), i.e. to holding a few lucky stocks with a wide enough stop |
 
 What it means: no setting shows an edge over simply holding SPY outside a few lucky stocks of one year, and neighbouring settings give wildly different results, which is what noise looks like. The apparent wins cannot be told apart from hindsight (the stock list). **Do not trade real money with this strategy.** Use the bot as a paper-trading and research tool, and settle the question with a point-in-time universe (delisted names included) before believing any number.
 
