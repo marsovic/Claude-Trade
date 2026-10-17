@@ -1,0 +1,26 @@
+{
+  "initial_eur": 100.0,
+  "final_eur": 89.31,
+  "return_pct": -10.69,
+  "cagr_pct": -1.57,
+  "max_drawdown_pct": 39.33,
+  "sharpe": 0.03,
+  "trades": 215,
+  "win_rate_pct": 36.7,
+  "profit_factor": 0.95,
+  "avg_r": 0.0,
+  "fees_eur": 19.71,
+  "trading_days": 1805,
+  "died": false,
+  "benchmark_spy_final_eur": 297.28,
+  "yearly_return_pct": {
+    "2019": 2.6,
+    "2020": 9.2,
+    "2021": 20.5,
+    "2022": -9.5,
+    "2023": -14.0,
+    "2024": 7.2,
+    "2025": -13.5,
+    "2026": -8.4
+  }
+}
