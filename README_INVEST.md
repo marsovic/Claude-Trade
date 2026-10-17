@@ -340,6 +340,7 @@ Full report: `study_events_preview/report.md`. The "edge" compares each event wi
 | Results + jump ≥ +5 % (post-earnings drift) | 496 / 422 | **+1.4 % / +1.9 %** (Holm p = 0.031, locked p = 0.003) | **not proven: carried by a handful of stocks** |
 | Results + drop ≥ 5 % | 394 / 431 | −1.0 % / −2.9 % | not proven |
 | Contract / agreement (8-K 1.01) | 562 / 369 | −1.8 % / −1.1 % (locked p = 0.064) | design-only veto |
+| Wikipedia spike (≥ 3× its 60-day median) | 279 / 236 | −0.8 % / +0.2 % | not proven (`study_events_preview/attention_report.md`) |
 
 What it means:
 - **Insider buying in large caps predicts nothing.** The literature finds the effect in small caps.
