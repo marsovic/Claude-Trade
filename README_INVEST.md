@@ -329,6 +329,26 @@ report also shows where events were lost:
 - a stock below 2 $ or below 1 M$ a day;
 - a repeat of an event already counted.
 
+### Point-in-time result: every US stock, 2024-10 to 2026-10 (`study_events_massive/report.md`)
+
+The universe covers 6 480 stocks, delisted ones included (3 596 tradable on a typical day). DESIGN runs until 2025-12 and LOCKED is 2026.
+
+| Definition | Events (design / locked) | Edge / net of costs, 20 sessions | Verdict |
+|---|---|---|---|
+| **CEO or CFO buys ≥ 50 k$** | 685 / 436 | **+2.3 % / +2.9 %**, net +1.7 % / +2.3 % | **VALIDATED BUY** |
+| Officer/director buys ≥ 100 k$, holding +20 % | 862 / 582 | +1.8 % / +3.1 % | VALIDATED BUY |
+| Officer/director buys ≥ 25 k$ | 2 161 / 1 410 | +1.4 % / +1.8 % | VALIDATED BUY |
+| Contract / financing agreement (8-K 1.01) | 4 350 / 2 668 | −1.7 % / −1.9 % | **VALIDATED VETO** |
+| Results + drop ≥ 5 % | 3 262 / 2 149 | −1.7 % / −2.3 % | VALIDATED VETO |
+| Results + jump ≥ 5 % (drift) | 3 096 / 2 117 | +1.7 % / +0.2 % | design only |
+| Insider cluster, news jump, Wikipedia spike | | | not proven |
+
+Cautions:
+- These are averages over many trades, and the median trade is close to zero: a few large winners do the work.
+- The effect is strongest in the least liquid stocks (1-5 M$/day), where the real spread can exceed the 1 % modelled.
+- Two years make a single market regime.
+- Next step: paper-trade it before any real money.
+
 ### First result: 134 large caps, 2018-2026 (run on the SEC data, survivorship-biased prices)
 
 Full report: `study_events_preview/report.md`. The "edge" compares each event with the same stocks on their ordinary days, over 20 sessions.
