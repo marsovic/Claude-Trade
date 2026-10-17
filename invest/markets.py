@@ -72,6 +72,13 @@ def is_trading_day(d: date) -> bool:
     return d.weekday() < 5 and d not in nyse_holidays(d.year)
 
 
+def last_trading_day(d: date) -> date:
+    """``d`` if it is a session, else the closest session before it."""
+    while not is_trading_day(d):
+        d -= timedelta(days=1)
+    return d
+
+
 def next_trading_day(d: date) -> date:
     d += timedelta(days=1)
     while not is_trading_day(d):

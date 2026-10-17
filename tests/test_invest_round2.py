@@ -40,7 +40,10 @@ def test_split_seen_on_a_weekend_takes_effect_next_session(tmp_path):
     store = BarStore(tmp_path, p, history_days=60)
     store.update(["AMD"], date(2026, 10, 9))  # Friday
     p.split = True
-    store.update(["AMD"], date(2026, 10, 11))  # Sunday: no new bar
+    calls = (len(p.history_calls), len(p.grouped_calls))
+    store.update(["AMD"], date(2026, 10, 11))  # Sunday: nothing new, nothing is requested
+    assert (len(p.history_calls), len(p.grouped_calls)) == calls and store.splits == {}
+    store.update(["AMD"], date(2026, 10, 12))  # Monday: the split shows, ex-date = Monday
     assert store.splits == {"AMD": ("2026-10-12", 10.0)}
 
 
@@ -187,3 +190,21 @@ def test_today_not_published_yet_is_skipped_not_fatal(tmp_path):
     frames = store.update(["AMD"], date(2026, 10, 14))  # no exception
     assert frames["AMD"].index[-1].date() == date(2026, 10, 13)
     assert store.splits == {}
+
+
+def test_unknown_ticker_and_corrupt_bars_do_not_stop_the_download(tmp_path):
+    from invest.data import DataNotFound, normalise
+
+    class Missing(FakeProvider):
+        def history(self, symbol, start, end):
+            if symbol == "GONE":
+                raise DataNotFound("Tiingo does not know GONE (HTTP 404)")
+            return super().history(symbol, start, end)
+
+    frames = BarStore(tmp_path, Missing(), history_days=60).update(["AMD", "GONE", "MSFT"],
+                                                                   date(2026, 10, 12))
+    assert frames["GONE"].empty and not frames["AMD"].empty and not frames["MSFT"].empty
+    bad = frames["AMD"].copy()
+    bad.iloc[3, bad.columns.get_loc("open")] = 0.0
+    bad.iloc[5, bad.columns.get_loc("low")] = -1.0
+    assert len(normalise(bad)) == len(bad) - 2  # zero and negative prices are dropped

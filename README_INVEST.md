@@ -226,15 +226,25 @@ An independent audit of the simulation engine (look-ahead, fills, exits, sizing)
 
 What the audit did change: the backtest could not open a stock for its first two months (`min_history`), a "trailing stop" label hid gap losses, an add to a winner ignored the 40 % cap and its own risk, the weekly loss pause was unreachable, three slots could all be AI chips, and the leveraged ETP sleeve was on by default.
 
-How to judge the strategy properly:
+How to judge the strategy properly, with 10 years of data instead of 26 trades:
 
 ```bash
-# 10 years of data (Tiingo, free key, ~3 h the first time, resumable)
+# 1. The study (Tiingo, free key in TIINGO_API_KEY): ~3 h the first time, then minutes
+python -m invest.study --provider tiingo --days 3000 --out study_invest
+# 2. The backtest of the whole bot (slots, cash, themes...) on the same data
 INV_DATA_DIR=data_invest_tiingo python -m invest.backtest --provider tiingo --days 3000 \
     --placebo 20 --out backtest_invest_tiingo
 ```
 
-`--placebo 20` replays the same exits, sizing, costs and market filter with **random entries**, and tells you how many of those random runs the real strategy beat. About 50 % means the 7 conditions are no better than picking at random; an edge shows up as a high percentage over hundreds of trades. The report also shows the equal-weight buy & hold of the whole universe next to SPY. Pick any parameter (e.g. `INV_TRAIL_ATR_MULT=4`) on the early years and confirm it on later years you have not looked at.
+**`invest.study`** treats every 7/7 signal of every day as one trade (no slot or cash limit), so ten years give thousands of trades. Parameter variants are declared in advance (`VARIANTS` in `invest/study.py`): stop and trailing distance, rank cut-off, distance to the 52-week high, volume factor, extension, entry filters... They are **selected on the first ~60 % of the years** and **confirmed once on the last ~40 %**, which the tool never shows for variants that did not pass. Every result is measured against the market's own drift (a longer hold earns more in a rising market even without skill), with a block bootstrap by week, Holm correction for the number of variants tried, and a random-entry placebo with the same holding time. The verdict is one of:
+
+- **KEEP THE DEFAULTS**: nothing beat the current rules robustly. This is the expected answer most of the time.
+- **ONE CHANGE IS SUPPORTED**: it names the exact `INV_*` variable to set. Apply it, then re-run the backtest.
+- **NO CONCLUSION**: not enough locked-years data or a data problem (it says which).
+
+Useful flags: `--csv-dir DIR` (offline), `--start/--end`, `--locked-from 2022`, `--no-vix`, `--audit full`. It writes `report.md`, `events.csv`, `variants.csv` and `summary.json` in `--out`. On synthetic markets with no edge it recommended a change in under 1 % of runs, and it detects a planted effect only when that effect is real, large enough and spread over the years. That is by design: a conservative tool, because a false recommendation changes a live trading rule.
+
+`invest.backtest --placebo N` is a quicker, rougher check of the whole bot (random entries, same exits and sizing); the study's placebo is the calibrated one. Also compare with the equal-weight buy & hold the backtest prints next to SPY.
 
 ## 7. Honest limitations
 

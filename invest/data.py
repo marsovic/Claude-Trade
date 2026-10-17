@@ -30,7 +30,7 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 import requests
 
-from invest.markets import next_trading_day, split_ratio
+from invest.markets import last_trading_day, next_trading_day, split_ratio
 
 log = logging.getLogger(__name__)
 ET = ZoneInfo("America/New_York")
@@ -39,6 +39,10 @@ COLUMNS = ["open", "high", "low", "close", "volume"]
 
 class DataError(RuntimeError):
     pass
+
+
+class DataNotFound(DataError):
+    """The provider does not know this symbol (delisted, renamed, wrong ticker)."""
 
 
 class DataNotReady(DataError):
@@ -57,7 +61,9 @@ def normalise(df: pd.DataFrame) -> pd.DataFrame:
     out.index = pd.DatetimeIndex(pd.to_datetime(out.index)).normalize()
     out.index.name = "date"
     out = out[~out.index.duplicated(keep="last")].sort_index()
-    return out.dropna(subset=["open", "high", "low", "close"])
+    out = out.dropna(subset=["open", "high", "low", "close"])
+    # A zero or negative price is a data error: it would poison returns, stops and R.
+    return out[(out[["open", "high", "low", "close"]] > 0).all(axis=1)]
 
 
 class RateLimiter:
@@ -83,7 +89,14 @@ class BarProvider:
         raise NotImplementedError
 
     def history_many(self, symbols: list[str], start: date, end: date) -> dict[str, pd.DataFrame]:
-        return {s: self.history(s, start, end) for s in symbols}
+        out = {}
+        for sym in symbols:
+            try:
+                out[sym] = self.history(sym, start, end)
+            except DataNotFound as exc:  # one unknown ticker must not stop the others
+                log.warning("%s skipped: %s (add it to INV_EXCLUDE to silence this)", sym, exc)
+                out[sym] = empty_frame()
+        return out
 
     def grouped(self, day: date) -> dict[str, dict] | None:
         return None
@@ -226,8 +239,10 @@ class TiingoProvider(BarProvider):
         resp = self.session.get(f"{self.BASE}/{symbol.replace('.', '-')}/prices",
                                 params={"startDate": str(start), "endDate": str(end)},
                                 timeout=30)
+        if resp.status_code == 404:
+            raise DataNotFound(f"Tiingo does not know {symbol} (HTTP 404)")
         if resp.status_code >= 400:
-            raise DataError(f"Tiingo HTTP {resp.status_code}: {resp.text[:200]}")
+            raise DataError(f"Tiingo HTTP {resp.status_code} for {symbol}: {resp.text[:200]}")
         rows = resp.json()
         if not rows:
             return empty_frame()
@@ -315,6 +330,7 @@ class BarStore:
         self.splits: dict[str, tuple[str, float]] = {}
         start_full = end - timedelta(days=self.history_days)
         frames = {s: self.load(s) for s in symbols}
+        target = last_trading_day(end)  # a weekend or holiday run needs nothing new
         need_full = [s for s, f in frames.items() if f.empty or f.index[0].date() > start_full
                      + timedelta(days=10)]
         if need_full:
@@ -333,7 +349,7 @@ class BarStore:
                     log.info("history: %d/%d symbols downloaded (last: %s)", done,
                              len(need_full), chunk[-1])
         stale = [s for s, f in frames.items() if s not in need_full and not f.empty
-                 and f.index[-1].date() < end]
+                 and f.index[-1].date() < target]
         if stale:
             last = {sym: frames[sym].index[-1] for sym in stale}
             mismatch: dict[str, float] = {}
