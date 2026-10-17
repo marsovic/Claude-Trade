@@ -110,6 +110,10 @@ class InvestSettings:
     min_beta: float = 1.0
 
     # --- Ranking & the 7 conditions ----------------------------------------------
+    # Conditions required to enter (a subset of signals.CONDITIONS; all 7 by default). A
+    # smaller set turns the bot into a rank-rotation strategy: see README_INVEST.md.
+    entry_conditions: list[str] = field(default_factory=lambda: [
+        "regime", "top_rank", "abs_momentum", "trend", "near_high", "breakout", "not_extended"])
     top_pct_entry: float = 0.10
     top_pct_hold: float = 0.25
     near_high_min: float = 0.85
@@ -232,6 +236,13 @@ class InvestSettings:
     def validate(self) -> None:
         self.broker = self.broker.lower()
         self.environment = self.environment.lower()
+        self.entry_conditions = [c.strip().lower() for c in self.entry_conditions]
+        from invest.signals import CONDITIONS  # local import: signals imports this module
+
+        unknown = [c for c in self.entry_conditions if c not in CONDITIONS]
+        if unknown or not self.entry_conditions:
+            raise ConfigError(f"INV_ENTRY_CONDITIONS: unknown {unknown or 'empty list'}; "
+                              f"choose among {', '.join(CONDITIONS)}")
         if self.broker not in BROKERS:
             raise ConfigError(f"INV_BROKER must be one of {BROKERS}")
         if self.environment not in ENVIRONMENTS:

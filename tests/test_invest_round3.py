@@ -172,3 +172,32 @@ def test_placebo_entries_do_not_need_signals(tmp_path):
     raw = run_placebo(bars, s, n_entries=15, runs=2, seed=3, out_dir=tmp_path / "b")
     assert sum(r["trades"] for r in raw["results"]) > 0
     assert isinstance(pd.Timestamp("2026-01-01"), pd.Timestamp)
+
+
+# ------------------------------------------------------ configurable conditions
+def test_a_subset_of_conditions_turns_the_bot_into_a_rank_rotation():
+    checks = {"regime": True, "top_rank": True, "abs_momentum": True, "trend": True,
+              "near_high": False, "breakout": False, "not_extended": True}
+    day = pd.Timestamp("2026-01-02")
+    full = StockEval("AMD", day, 50.0, 2.0, 4.0, 1.0, 0.99, True, dict(checks), {})
+    assert full.signal is False  # a breakout bot needs all 7
+    core = StockEval("AMD", day, 50.0, 2.0, 4.0, 1.0, 0.99, True, dict(checks), {},
+                     required=("regime", "top_rank", "abs_momentum", "trend"))
+    assert core.signal is True
+    assert StockEval("AMD", day, 50.0, 2.0, 4.0, 1.0, 0.99, False, dict(checks), {},
+                     required=("top_rank",)).signal is False  # eligibility always applies
+
+
+def test_entry_conditions_are_validated_and_read_from_the_environment(monkeypatch):
+    import pytest
+
+    from invest.config import ConfigError
+
+    assert settings().entry_conditions[0] == "regime" and len(settings().entry_conditions) == 7
+    with pytest.raises(ConfigError, match="INV_ENTRY_CONDITIONS"):
+        settings(entry_conditions=["top_rank", "magic"])
+    with pytest.raises(ConfigError):
+        settings(entry_conditions=[])
+    monkeypatch.setenv("INV_ENTRY_CONDITIONS", "regime,TOP_RANK, trend")
+    s = InvestSettings.from_env(None, broker="sim", etp_enabled=False, state_dir="x")
+    assert s.entry_conditions == ["regime", "top_rank", "trend"]

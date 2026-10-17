@@ -204,10 +204,12 @@ class StockEval:
     eligible: bool
     checks: dict[str, bool]
     values: dict[str, float]
+    required: tuple[str, ...] | None = None  # conditions that must hold (None = all)
 
     @property
     def signal(self) -> bool:
-        return self.eligible and all(self.checks.values())
+        keys = self.required or tuple(self.checks)
+        return self.eligible and all(self.checks[k] for k in keys)
 
     @property
     def n_ok(self) -> int:
@@ -253,7 +255,9 @@ def evaluate(sym: str, row: pd.Series, regime: Regime, s) -> StockEval:
     return StockEval(symbol=sym, day=row.name, price=close, atr=val("atr", 0.0),
                      atr_pct=val("atr_pct", 0.0), score=None if np.isnan(score) else score,
                      pct_rank=None if np.isnan(pct) else pct,
-                     eligible=bool(row.get("eligible", False)), checks=checks, values=values)
+                     eligible=bool(row.get("eligible", False)), checks=checks, values=values,
+                     required=tuple(s.entry_conditions) if getattr(s, "entry_conditions", None)
+                     else None)
 
 
 def evaluate_day(panel: dict[str, pd.DataFrame], day: pd.Timestamp, regime: Regime, s
