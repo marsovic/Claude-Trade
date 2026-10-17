@@ -119,11 +119,20 @@ class MassiveProvider(BarProvider):
         self.sleep = sleep
 
     def _get(self, path: str, params: dict) -> dict:
+        url = path if path.startswith("http") else self.BASE + path
         for attempt in range(4):
             self.limiter.wait()
-            resp = self.session.get(self.BASE + path, params=params, timeout=30)
+            try:
+                resp = self.session.get(url, params=params, timeout=30)
+            except requests.exceptions.RequestException as exc:
+                # a Wi-Fi change or a sleeping laptop must not end a 2-hour download
+                if attempt == 3:
+                    raise DataError(f"Massive unreachable: {exc}") from exc
+                self.sleep(15 * (attempt + 1))
+                continue
             text = resp.text[:300]
-            if resp.status_code == 429 or "maximum requests" in text.lower():
+            if (resp.status_code in (429, 500, 502, 503, 504)
+                    or "maximum requests" in text.lower()):
                 self.sleep(15 * (attempt + 1))
                 continue
             if "before end of day" in text.lower():
@@ -133,7 +142,7 @@ class MassiveProvider(BarProvider):
             if resp.status_code >= 400:
                 raise DataError(f"Massive HTTP {resp.status_code}: {text}")
             return resp.json()
-        raise DataError("Massive: rate limited too many times")
+        raise DataError("Massive: rate limited or failing too many times")
 
     @staticmethod
     def _rows_to_frame(rows: list[dict], key_ts: str = "t") -> pd.DataFrame:
@@ -151,11 +160,25 @@ class MassiveProvider(BarProvider):
                          {"adjusted": "true", "sort": "asc", "limit": 50000})
         return self._rows_to_frame(body.get("results") or [])
 
-    def grouped(self, day: date) -> dict[str, dict] | None:
-        body = self._get(f"/v2/aggs/grouped/locale/us/market/stocks/{day}", {"adjusted": "true"})
+    def grouped(self, day: date, adjusted: bool = True) -> dict[str, dict] | None:
+        body = self._get(f"/v2/aggs/grouped/locale/us/market/stocks/{day}",
+                         {"adjusted": "true" if adjusted else "false"})
         rows = body.get("results") or []
         return {r["T"]: {"open": r["o"], "high": r["h"], "low": r["l"], "close": r["c"],
                          "volume": r.get("v", 0.0)} for r in rows if "T" in r}
+
+    def splits(self, start: date, end: date) -> list[dict]:
+        """Splits executed in [start, end]: ticker, execution_date, split_from, split_to."""
+        out: list[dict] = []
+        path: str | None = "/v3/reference/splits"
+        params: dict = {"execution_date.gte": str(start), "execution_date.lte": str(end),
+                        "limit": 1000, "order": "asc", "sort": "execution_date"}
+        while path:
+            body = self._get(path, params)
+            out += [r for r in body.get("results") or []
+                    if r.get("ticker") and r.get("split_from") and r.get("split_to")]
+            path, params = body.get("next_url"), {}
+        return out
 
 
 class AlpacaDataProvider(BarProvider):

@@ -66,6 +66,7 @@ MIN_DESIGN = 100
 MIN_LOCKED = 50
 ALPHA = 0.05
 PLACEBO_WINDOW = 126  # sessions on each side of a real event where its placebo is drawn
+TOP_K = 10  # an edge must survive without the stocks that contribute most to it
 
 
 @dataclass(frozen=True)
@@ -128,6 +129,9 @@ Fixed before the data was seen:
 * DESIGN: at least {MIN_DESIGN} events, Holm-adjusted two-sided p < {ALPHA} on the edge, and the
   abnormal mean beyond its placebo (above the 95th percentile of random-day means for a
   buy, below the 5th for a veto);
+* without the {TOP_K} stocks that contribute most to it, a buy must still be positive NET of
+  costs and a veto still negative (in both periods): a result carried by a few stars is
+  not an effect;
 * LOCKED (the later period): at least {MIN_LOCKED} events, same sign, one-sided p < {ALPHA};
 * a BUY signal must also be positive NET of costs (edge - FX - spread) in both periods;
 * verdicts: VALIDATED BUY, VALIDATED VETO, DESIGN ONLY (did not hold in LOCKED), NOT PROVEN.
@@ -143,39 +147,80 @@ class EventStudyError(RuntimeError):
 class Panel:
     days: pd.DatetimeIndex
     symbols: list[str]
-    open: np.ndarray
+    open: np.ndarray  # split-adjusted within the panel: returns are measured on these
     close: np.ndarray
     cff: np.ndarray  # close carried forward (a delisted stock keeps its last close)
     prev: np.ndarray  # previous session's close (carried forward)
     dv: np.ndarray  # mean dollar volume of the 20 sessions BEFORE each session
     last: np.ndarray  # per symbol: index of its last close
     col: dict[str, int] = field(default_factory=dict)
+    # prices as they traded that day (no later split folded in): the $2 filter and the
+    # insider price check must not know about a split that had not happened yet
+    prev_raw: np.ndarray | None = None
+    cff_raw: np.ndarray | None = None
+
+    def __post_init__(self):
+        if self.prev_raw is None:
+            self.prev_raw = self.prev
+        if self.cff_raw is None:
+            self.cff_raw = self.cff
 
     @property
     def T(self) -> int:
         return len(self.days)
 
 
-def make_panel(opens: pd.DataFrame, closes: pd.DataFrame, volumes: pd.DataFrame) -> Panel:
+def make_panel(opens: pd.DataFrame, closes: pd.DataFrame, volumes: pd.DataFrame,
+               scale: np.ndarray | None = None) -> Panel:
+    """``scale`` (same shape, aligned on the weekday rows) turns as-traded prices into prices
+    adjusted for the splits inside the panel; None when the prices are adjusted already."""
     opens = opens.sort_index()
     keep = opens.index.dayofweek < 5
     opens = opens[keep]
+    if scale is not None:
+        scale = np.asarray(scale, dtype=float)[np.asarray(keep)]
     closes = closes.reindex(index=opens.index, columns=opens.columns)
     volumes = volumes.reindex(index=opens.index, columns=opens.columns)
     opn = opens.to_numpy(dtype=float, copy=True)
     C = closes.to_numpy(dtype=float, copy=True)
     bad = ~(opn > 0) | ~(C > 0)
     opn[bad], C[bad] = np.nan, np.nan
-    cdf = pd.DataFrame(C, index=opens.index, columns=opens.columns)
-    cff = cdf.ffill().to_numpy()
-    prev = np.vstack([np.full((1, C.shape[1]), np.nan), cff[:-1]])
-    dollar = cdf * volumes.to_numpy(dtype=float)
-    dv = dollar.rolling(20, min_periods=10).mean().shift(1).to_numpy()
+    raw = pd.DataFrame(C, index=opens.index, columns=opens.columns)
+    # as-traded close x as-traded volume: a split leaves the dollar volume unchanged
+    dv = (raw * volumes.to_numpy(dtype=float)).rolling(20, min_periods=10).mean().shift(1)
+    cff_raw = raw.ffill().to_numpy()
+    nan_row = np.full((1, C.shape[1]), np.nan)
+    prev_raw = np.vstack([nan_row, cff_raw[:-1]])
+    if scale is not None:
+        opn, C = opn * scale, C * scale
+        cff = pd.DataFrame(C).ffill().to_numpy()
+        prev = np.vstack([nan_row, cff[:-1]])
+    else:
+        cff, prev = cff_raw, prev_raw
     finite = np.isfinite(C)
     last = np.where(finite.any(0), len(C) - 1 - np.argmax(finite[::-1], axis=0), -1)
     syms = [str(c) for c in opens.columns]
     return Panel(days=pd.DatetimeIndex(opens.index), symbols=syms, open=opn, close=C, cff=cff,
-                 prev=prev, dv=dv, last=last, col={s: i for i, s in enumerate(syms)})
+                 prev=prev, dv=dv.to_numpy(), last=last, col={s: i for i, s in enumerate(syms)},
+                 prev_raw=prev_raw, cff_raw=cff_raw)
+
+
+def split_scale(days: pd.DatetimeIndex, symbols, splits: list[dict]) -> np.ndarray:
+    """Factor turning as-traded prices into split-adjusted ones: every day before a split's
+    execution (ex) date is multiplied by split_from / split_to (a 2-for-1 halves them)."""
+    col = {s: i for i, s in enumerate(symbols)}
+    scale = np.ones((len(days), len(col)))
+    for sp in splits:
+        j = col.get(str(sp.get("ticker", "")))
+        try:
+            factor = float(sp["split_from"]) / float(sp["split_to"])
+            ex = pd.Timestamp(sp["execution_date"])
+        except (KeyError, TypeError, ValueError, ZeroDivisionError):
+            continue
+        if j is None or not factor > 0:
+            continue
+        scale[days < ex, j] *= factor
+    return scale
 
 
 def panel_from_frames(frames: dict[str, pd.DataFrame]) -> Panel:
@@ -188,14 +233,17 @@ def panel_from_frames(frames: dict[str, pd.DataFrame]) -> Panel:
     return make_panel(opens, closes, vols)
 
 
-def panel_from_long(df: pd.DataFrame) -> Panel:
-    """``df`` columns: date, symbol, open, close, volume (one row per stock and day)."""
+def panel_from_long(df: pd.DataFrame, splits: list[dict] | None = None) -> Panel:
+    """``df`` columns: date, symbol, open, close, volume (one row per stock and day).  With
+    ``splits`` the prices are as traded and get adjusted here (see ``split_scale``)."""
     if df.empty:
         raise EventStudyError("no price data")
     df = df.drop_duplicates(["date", "symbol"], keep="last")
-    wide = {c: df.pivot(index="date", columns="symbol", values=c)
+    wide = {c: df.pivot(index="date", columns="symbol", values=c).sort_index()
             for c in ("open", "close", "volume")}
-    return make_panel(wide["open"], wide["close"], wide["volume"])
+    scale = (split_scale(pd.DatetimeIndex(wide["open"].index), wide["open"].columns, splits)
+             if splits is not None else None)
+    return make_panel(wide["open"], wide["close"], wide["volume"], scale)
 
 
 def _clip(x: np.ndarray) -> np.ndarray:
@@ -239,7 +287,7 @@ def _excess(r: np.ndarray, s: np.ndarray, c: np.ndarray) -> np.ndarray:
 
 def tradable_mask(p: Panel) -> np.ndarray:
     with np.errstate(invalid="ignore"):
-        return np.isfinite(p.open) & (p.prev >= MIN_PRICE) & (p.dv >= MIN_DV)
+        return np.isfinite(p.open) & (p.prev_raw >= MIN_PRICE) & (p.dv >= MIN_DV)
 
 
 def forward(p: Panel, t: np.ndarray | int, j: np.ndarray | int, h: int) -> np.ndarray:
@@ -369,7 +417,7 @@ def insider_events(buys: pd.DataFrame, p: Panel, funnel: Funnel) -> pd.DataFrame
                      for d in b["traded"].fillna(b["filed"])], dtype=int)
     has = b["j"].notna().to_numpy()
     jj = b["j"].fillna(0).astype(int).to_numpy()
-    close_then = np.where(has, p.cff[tday, jj], np.nan)
+    close_then = np.where(has, p.cff_raw[tday, jj], np.nan)
     b["price_ok"] = price_matches(b["price"].to_numpy(float), close_then)
     b["has"] = has
     v = b["value"].astype(float)
@@ -467,13 +515,16 @@ def eightk_events(filings: pd.DataFrame, resolve, p: Panel, b: Bench, funnel: Fu
 def wiki_events(views: dict[str, pd.Series], p: Panel, funnel: Funnel,
                 ratio: float = 3.0, floor: float = 1000.0) -> pd.DataFrame:
     rows = []
-    n_raw = n_missing = 0
+    n_raw = n_missing = n_early = 0
     for sym, s in views.items():
         if s.empty:
             continue
         s = s.sort_index().astype(float)
         med = s.shift(1).rolling(60, min_periods=30).median()
         hit = s[(s >= floor) & (s >= ratio * med.clip(lower=1.0))]
+        early = hit.index < p.days[0] - pd.Timedelta(days=1)
+        n_early += int(early.sum())
+        hit = hit[~early]
         n_raw += len(hit)
         if sym not in p.col:
             n_missing += len(hit)
@@ -485,6 +536,8 @@ def wiki_events(views: dict[str, pd.Series], p: Panel, funnel: Funnel,
                          "detail": f"{v:,.0f} views, x{v / max(med.get(d, 1.0), 1.0):.1f}"})
     funnel.add("wiki_spike", "raw", n_raw)
     funnel.add("wiki_spike", "no price history for the ticker", n_missing)
+    if n_early:
+        funnel.add("wiki_spike", "before the first price day (not counted in raw)", n_early)
     return pd.DataFrame(rows, columns=EVENT_COLUMNS)
 
 
@@ -672,6 +725,8 @@ def analyse(ev: pd.DataFrame, p: Panel, b: Bench, funnel: Funnel, locked_from: p
             row[f"{seg}_placebo_p95"] = float(np.percentile(pl, 95)) if len(pl) else np.nan
             row[f"{seg}_placebo_rank"] = (float((pl < raw["mean"]).mean()) if len(pl)
                                           and np.isfinite(raw["mean"]) else np.nan)
+            row[f"{seg}_edge_wo_top"], row[f"{seg}_net_wo_top"] = _edge_without_top(
+                s, abn - usual, st["mean"], all_t0, p, b, draws, seed)
         rows.append(row)
     table = pd.DataFrame(rows)
     if not table.empty:
@@ -682,9 +737,31 @@ def analyse(ev: pd.DataFrame, p: Panel, b: Bench, funnel: Funnel, locked_from: p
             adj[ok] = holm_adjust(pv[ok])
         table["design_p_holm"] = adj
         table["verdict"] = [verdict(r) for r in table.to_dict("records")]
+        if (meta or {}).get("hand_picked"):
+            table["verdict"] = [v + " - on a hand-picked list: confirm with --prices massive"
+                                if v.startswith("VALIDATED") else v for v in table["verdict"]]
     return EventResult(table=table, events=ev, funnel=funnel, meta=meta or {},
                        per_year=_per_year(ev), horizons=_horizons(ev),
                        by_liquidity=_by_liquidity(ev))
+
+
+def _edge_without_top(s: pd.DataFrame, edge: np.ndarray, mean: float, all_t0, p: Panel,
+                      b: Bench, draws: int, seed: int) -> tuple[float, float]:
+    """(edge, net edge) once the TOP_K stocks that push it most in its own direction are
+    removed, measured against THEIR usual days again.  A hand-picked list of today's
+    winners can owe a 'post-earnings drift' to a few stars that became winners through
+    those very rallies."""
+    if len(s) < 3 * TOP_K or not np.isfinite(mean):
+        return np.nan, np.nan
+    contrib = pd.Series(edge, index=s.index).groupby(s["symbol"]).sum()
+    top = (contrib.nlargest(TOP_K) if mean > 0 else contrib.nsmallest(TOP_K)).index
+    rest = s[~s["symbol"].isin(top)]
+    if rest.empty:
+        return np.nan, np.nan
+    pl = placebo(rest, all_t0, p, b, max(draws // 2, 50), seed + 2)
+    usual = float(np.median(pl)) if len(pl) else 0.0
+    e = float(rest[f"abn_{PRIMARY}"].mean() - usual)
+    return e, e - float(rest["cost"].mean())
 
 
 def verdict(r: dict) -> str:
@@ -699,18 +776,27 @@ def verdict(r: dict) -> str:
             return "NOT PROVEN (no better than buying the same stocks on random days)"
         if not r["design_net"] > 0:
             return "NOT PROVEN (positive but eaten by costs)"
+        if not r.get("design_net_wo_top", np.nan) > 0:
+            return (f"NOT PROVEN (carried by a handful of stocks: without the top {TOP_K} it "
+                    "does not pay its costs)")
         if n_l < MIN_LOCKED:
             return f"DESIGN ONLY (locked period has {n_l} events, {MIN_LOCKED} needed)"
-        if r["locked_mean"] > 0 and r["locked_p_pos"] < ALPHA and r["locked_net"] > 0:
-            return "VALIDATED BUY"
-        return "DESIGN ONLY (did not hold in the locked period)"
+        if not (r["locked_mean"] > 0 and r["locked_p_pos"] < ALPHA and r["locked_net"] > 0):
+            return "DESIGN ONLY (did not hold in the locked period)"
+        if not r.get("locked_net_wo_top", np.nan) > 0:
+            return f"DESIGN ONLY (locked result carried by its top {TOP_K} stocks)"
+        return "VALIDATED BUY"
     if not r["design_abn"] < r["design_placebo_p5"]:
         return "NOT PROVEN (no worse than the same stocks on random days)"
+    if not r.get("design_edge_wo_top", np.nan) < 0:
+        return f"NOT PROVEN (carried by a handful of stocks: gone without the top {TOP_K})"
     if n_l < MIN_LOCKED:
         return f"DESIGN ONLY veto (locked period has {n_l} events, {MIN_LOCKED} needed)"
-    if r["locked_mean"] < 0 and r["locked_p_neg"] < ALPHA:
-        return "VALIDATED VETO"
-    return "DESIGN ONLY veto (did not hold in the locked period)"
+    if not (r["locked_mean"] < 0 and r["locked_p_neg"] < ALPHA):
+        return "DESIGN ONLY veto (did not hold in the locked period)"
+    if not r.get("locked_edge_wo_top", np.nan) < 0:
+        return f"DESIGN ONLY veto (locked result carried by its top {TOP_K} stocks)"
+    return "VALIDATED VETO"
 
 
 def _per_year(ev: pd.DataFrame) -> pd.DataFrame:
@@ -768,8 +854,9 @@ def render_report(res: EventResult) -> str:
             "public. Abnormal = vs stocks of the same liquidity group. Edge = abnormal minus "
             "what the same stocks earn on ordinary days. Net = edge minus FX and spread.", "",
             "| definition | verdict | design n | abnormal | same stocks, usual days | edge | "
-            "net edge | 95 % CI of edge | Holm p | locked n | locked edge | net | p |",
-            "|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
+            f"net edge | 95 % CI of edge | Holm p | net w/o top {TOP_K} | locked n | "
+            f"locked edge | net | p | net w/o top {TOP_K} |",
+            "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
     for r in res.table.to_dict("records"):
         lp = r["locked_p_pos"] if (r["locked_mean"] or 0) >= 0 else r["locked_p_neg"]
         out.append(
@@ -777,8 +864,9 @@ def render_report(res: EventResult) -> str:
             f"{_pct(r['design_abn'])} | {_pct(r['design_usual'])} | "
             f"{_pct(r['design_mean'])} | {_pct(r['design_net'])} | "
             f"{_pct(r['design_lo'])} .. {_pct(r['design_hi'])} | {_p(r['design_p_holm'])} | "
+            f"{_pct(r['design_net_wo_top'])} | "
             f"{r['locked_n']} | {_pct(r['locked_mean'])} | {_pct(r['locked_net'])} | "
-            f"{_p(lp)} |")
+            f"{_p(lp)} | {_pct(r['locked_net_wo_top'])} |")
     out += ["", "## Rule", "", DECISION_RULE, "## Definitions", ""]
     for d in DEFINITIONS:
         if d.name in res.funnel.counts:
@@ -835,49 +923,60 @@ def write_outputs(res: EventResult, out_dir: str | Path) -> None:
 # ===================================================================== sources
 class GroupedStore:
     """Whole-market daily bars from one grouped call per session (Massive), cached per day.
-    Point-in-time: a stock is there on the days it traded, delisted or not."""
+    Point-in-time: a stock is there on the days it traded, delisted or not.  With
+    ``adjusted=False`` the files hold as-traded prices, which never change afterwards, so a
+    resume weeks later cannot mix two split adjustments."""
 
-    def __init__(self, folder: str | Path, provider):
+    MAX_REFUSED = 15  # oldest days refused in a row before giving up
+
+    def __init__(self, folder: str | Path, provider, adjusted: bool = True):
         self.dir = Path(folder)
         self.dir.mkdir(parents=True, exist_ok=True)
         self.p = provider
+        self.adjusted = adjusted
 
     def path(self, day: date) -> Path:
         return self.dir / f"{day}.csv.gz"
 
-    MAX_REFUSED = 15  # oldest days refused in a row before giving up
+    def refused_path(self, day: date) -> Path:
+        return self.dir / f"{day}.refused"
 
     def update(self, start: date, end: date) -> int:
         """Download the missing sessions, oldest first.  The provider counts its plan's
         history window (2 years on Massive's free plan) from its own clock, so the oldest
-        day or two of a request can fall just outside it: those are skipped, as long as
-        they come before any day that was served."""
+        day or two of a request can fall just outside it.  Such days are skipped when they
+        are older than every day served, and remembered so a re-run does not ask again."""
         from invest.data import DataError, DataNotReady
         from invest.markets import is_trading_day
 
         days = [start + timedelta(days=i) for i in range((end - start).days + 1)]
-        todo = [d for d in days if is_trading_day(d) and not self.path(d).exists()]
+        todo = [d for d in days if is_trading_day(d) and not self.path(d).exists()
+                and not self.refused_path(d).exists()]
         if todo:
             eta = len(todo) * getattr(getattr(self.p, "limiter", None), "interval", 0.0) / 60
             log.info("grouped bars: %d session(s) to download (~%.0f min at the provider's "
                      "rate limit); each day is saved, a new run resumes", len(todo), eta)
-        served = bool(list(self.dir.glob("*.csv.gz")))
+        cached = sorted(f.name[:10] for f in self.dir.glob("*.csv.gz"))
+        served = False
         refused: list[date] = []
         for n, d in enumerate(todo, 1):
             try:
-                rows = self.p.grouped(d) or {}
+                rows = self.p.grouped(d, adjusted=self.adjusted) or {}
             except DataNotReady:
                 break
             except DataError as exc:
                 text = str(exc).lower()
                 outside = "entitlement" in text or "not_authorized" in text
-                if not outside or served or len(refused) >= self.MAX_REFUSED:
+                older = not cached or str(d) < cached[0]
+                if not outside or served or not older or len(refused) >= self.MAX_REFUSED:
                     raise
                 refused.append(d)
                 continue
             if refused and not served:
                 log.warning("grouped bars: the provider's plan starts after %s; %d older "
                             "session(s) skipped", refused[-1], len(refused))
+                for r in refused:  # a later day was served: these are the plan's edge
+                    self.refused_path(r).write_text("outside the plan's history\n")
             served = True
             df = pd.DataFrame.from_dict(rows, orient="index")
             df.index.name = "symbol"
@@ -904,6 +1003,68 @@ class GroupedStore:
         if not frames:
             return pd.DataFrame(columns=["date", "symbol", "open", "close", "volume"])
         return pd.concat(frames, ignore_index=True)
+
+
+def migrate_adjusted(old: GroupedStore, new: GroupedStore, splits: list[dict]) -> int:
+    """Turn day files saved with ``adjusted=true`` (adjusted for the splits known on the day
+    they were downloaded: the file's date) into as-traded files, so an earlier download is
+    not thrown away.  Prices are divided, volumes multiplied, by split_from / split_to of
+    every split executed after that session and up to the download day."""
+    by_ticker: dict[str, list[tuple[str, float]]] = {}
+    for sp in splits:
+        try:
+            f = float(sp["split_from"]) / float(sp["split_to"])
+            by_ticker.setdefault(str(sp["ticker"]), []).append((str(sp["execution_date"]), f))
+        except (KeyError, TypeError, ValueError, ZeroDivisionError):
+            continue
+    moved = 0
+    for path in sorted(old.dir.glob("*.csv.gz")):
+        day = path.name[:10]
+        target = new.dir / path.name
+        if target.exists():
+            continue
+        fetched = datetime.fromtimestamp(path.stat().st_mtime).strftime("%Y-%m-%d")
+        df = pd.read_csv(path, compression="gzip", keep_default_na=False, na_values=[""],
+                         dtype={"symbol": str})
+        if not df.empty and "symbol" in df.columns:
+            factor = np.array([np.prod([f for ex, f in by_ticker.get(s, ())
+                                        if day < ex <= fetched]) for s in df["symbol"]])
+            for c in ("open", "high", "low", "close"):
+                if c in df.columns:
+                    df[c] = df[c] / factor
+            if "volume" in df.columns:
+                df["volume"] = df["volume"] * factor
+        tmp = target.with_suffix(".tmp")
+        df.to_csv(tmp, compression="gzip", index=False)
+        tmp.replace(target)
+        moved += 1
+    return moved
+
+
+def massive_splits(provider, path: Path, start: date, today: date) -> list[dict] | None:
+    """The split list from ``start`` to today, cached for 12 hours (new splits re-adjust
+    every cached day, so it is fetched again rather than kept).  None when the plan
+    refuses it."""
+    from invest.data import DataError
+
+    with contextlib.suppress(OSError, ValueError, KeyError):
+        cached = json.loads(path.read_text())
+        age = datetime.now().timestamp() - float(cached["fetched_ts"])
+        if cached["start"] <= str(start) and age < 12 * 3600:
+            return cached["splits"]
+    try:
+        splits = provider.splits(start, today)
+    except DataError as exc:
+        if "not in your plan" in str(exc) or "not_authorized" in str(exc).lower():
+            log.warning("Massive refused the split list (%s): falling back to adjusted bars",
+                        exc)
+            return None
+        raise
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"start": str(start), "fetched_ts": datetime.now().timestamp(),
+                                "splits": splits}))
+    log.info("Massive: %d splits since %s", len(splits), start)
+    return splits
 
 
 def _csv_frames(folder: str | Path) -> dict[str, pd.DataFrame]:
@@ -957,7 +1118,7 @@ def _stop(message: str) -> int:
 def main(argv=None) -> int:
     from invest.config import ConfigError, InvestSettings
     from invest.data import BarStore, DataError, MassiveProvider, TiingoProvider
-    from invest.edgar import Edgar, EdgarError, accepted_et, symbol_resolver
+    from invest.edgar import Edgar, EdgarError, symbol_resolver
     from invest.universe import build_universe
 
     ap = argparse.ArgumentParser(description="Event study: insider buys, 8-K announcements "
@@ -1020,17 +1181,36 @@ def main(argv=None) -> int:
                             "that failed or were delisted are missing, which flatters any "
                             "rule. Trust only effects that also beat the placebo.")
         elif args.prices == "massive":
-            store = GroupedStore(data / "grouped", MassiveProvider(s.massive_api_key))
-            try:
-                store.update(start, end)
-            except DataError as exc:
-                raise EventStudyError(f"Massive refused a day ({exc}). The free plan covers "
-                                      "about 2 years: try --days 700") from exc
-            uni = set(issuers["symbol"]) if issuers is not None and not issuers.empty else None
-            p = panel_from_long(store.load(start, end, uni))
+            prov = MassiveProvider(s.massive_api_key)
             survivorship = ("none by construction: every stock that traded each day is in "
                             "the data, including those delisted since. Only 2 years on the "
                             "free plan, so the samples are small.")
+            # as-traded bars + the split list: the $2 filter and the insider price check
+            # then see the price of the day, not one rescaled by a later (reverse) split
+            splits = massive_splits(prov, data / "massive_splits.json", start, today)
+            if splits is None:
+                store = GroupedStore(data / "grouped", prov, adjusted=True)
+                survivorship += (" The split list was refused, so prices are adjusted for "
+                                 "splits known at download time: a later reverse split can "
+                                 "let a sub-$2 stock through the price filter.")
+            else:
+                store = GroupedStore(data / "grouped_raw", prov, adjusted=False)
+                old = data / "grouped"
+                if old.is_dir() and any(old.glob("*.csv.gz")):
+                    n = migrate_adjusted(GroupedStore(old, prov), store, splits)
+                    if n:
+                        log.info("reused %d day(s) downloaded earlier as adjusted bars "
+                                 "(converted back to as-traded prices)", n)
+            try:
+                store.update(start, end)
+            except DataError as exc:
+                text = str(exc).lower()
+                hint = (" The free plan covers about 2 years: try --days 700."
+                        if "entitlement" in text or "not_authorized" in text else
+                        " Run the same command again: every day already downloaded is kept.")
+                raise EventStudyError(f"Massive refused a day ({exc}).{hint}") from exc
+            uni = set(issuers["symbol"]) if issuers is not None and not issuers.empty else None
+            p = panel_from_long(store.load(start, end, uni), splits=splits)
         else:
             want = list(build_universe(s.universe or None, s.exclude)) + [s.benchmark]
             if insiders is not None and not insiders.empty:
@@ -1056,21 +1236,21 @@ def main(argv=None) -> int:
                              if issuers is not None else set()))
             log.info("8-K filings of %d companies (one or two SEC requests each; cached)",
                      len(ciks))
-            got = []
-            calibrated = False
+            got, failed = [], []
             for n, cik in enumerate(ciks, 1):
-                df = edgar.eight_ks(cik, start, end)
-                if not calibrated and len(df) >= 3:
-                    tail = df.tail(3)
-                    edgar.calibrate(list(zip([cik] * 3, tail["accession"], tail["raw_time"],
-                                             strict=True)))
-                    calibrated = True
-                    got = [g.assign(accepted_et=[accepted_et(x, edgar.time_mode)
-                                                 for x in g["raw_time"]]) for g in got]
-                    df = edgar.eight_ks(cik, start, end)
-                got.append(df)
+                try:
+                    got.append(edgar.eight_ks(cik, start, end))
+                except (EdgarError, OSError, ValueError, KeyError) as exc:
+                    # one bad company must not end a 40-minute loop; a re-run retries it
+                    failed.append(cik)
+                    log.warning("8-K of CIK %s skipped: %s", cik, exc)
                 if n % 100 == 0:
                     log.info("8-K: %d / %d companies", n, len(ciks))
+            if failed:
+                log.warning("8-K: %d of %d companies failed (network?); run the same "
+                            "command again to fetch them", len(failed), len(ciks))
+                survivorship += (f" 8-K filings of {len(failed)} of {len(ciks)} companies "
+                                 "could not be downloaded.")
             filings = pd.concat(got, ignore_index=True) if got else None
         wiki = reddit = None
         if "attention" in fams:
@@ -1085,7 +1265,8 @@ def main(argv=None) -> int:
                   filings=filings, resolve=resolve, wiki=wiki, reddit=reddit,
                   locked_from=locked, n_boot=args.boot, draws=args.placebo_draws,
                   seed=args.seed, meta={"prices": args.prices, "survivorship": survivorship,
-                                        "families": fams},
+                                        "families": fams,
+                                        "hand_picked": args.prices != "massive"},
                   filing_families=tuple(f for f in fams if f in ("earnings", "filings")))
         write_outputs(res, args.out)
     except (EdgarError, DataError, EventStudyError) as exc:

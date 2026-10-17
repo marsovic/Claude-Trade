@@ -9,10 +9,13 @@
 SEC fair-access rules: at most 10 requests per second and a User-Agent that names you
 and gives an email (SEC_USER_AGENT="Firstname Lastname you@example.com").
 
-Pitfall handled here: the ``acceptanceDateTime`` of the submissions JSON is New York
-wall-clock time shifted TWICE by the UTC offset (a filing accepted 06:30 ET reads
-"14:30Z" in summer, not "10:30Z").  ``accepted_et`` undoes it, and ``calibrate`` checks
-it against the filing header on a few filings before a study relies on it.
+Pitfall handled here: the ``acceptanceDateTime`` of the submissions JSON comes in two
+formats depending on the company file.  Some files hold true UTC (Abbott, AAR); others
+hold New York wall-clock time shifted TWICE by the UTC offset (Apple, JPMorgan, Nvidia: a
+filing accepted 06:30 ET reads "14:30Z" in summer, not "10:30Z").  ``block_mode`` tells
+them apart for each file (the wrong reading puts filings outside EDGAR's 06:00-22:00
+hours), the filing header settles a tie, and when nothing decides, the later reading is
+used: an entry can then come late, never before the news was public.
 """
 
 from __future__ import annotations
@@ -25,6 +28,7 @@ import re
 import time
 import zipfile
 from datetime import date, datetime, timedelta, timezone
+from datetime import time as dtime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -46,7 +50,8 @@ PURCHASE_COLUMNS = ["accession", "filed", "traded", "cik", "symbol", "owner_cik"
                     "role", "officer", "director", "owner10", "shares", "value", "price",
                     "owned_after", "delta_own", "plan"]
 ISSUER_COLUMNS = ["cik", "symbol", "first", "last"]
-EIGHTK_COLUMNS = ["cik", "accession", "filed", "items", "raw_time"]
+EIGHTK_COLUMNS = ["cik", "accession", "filed", "items", "raw_time", "mode"]
+EDGAR_HOURS = (dtime(5, 55), dtime(22, 5))  # EDGAR accepts filings 06:00-22:00 New York
 _NOT_SHARES = ("preferred", "note", "warrant", "debenture", "right", "unit", "option",
                "bond", "swap")
 _UA = re.compile(r"\S+@\S+\.\S+")
@@ -68,8 +73,8 @@ def _check_agent(user_agent: str) -> str:
 def accepted_et(text: str, mode: str = "double") -> datetime | None:
     """New York time of an ``acceptanceDateTime`` from the submissions JSON.
 
-    ``double`` (observed 2025-2026): the value is ET wall time plus twice the UTC offset.
-    ``single``: the value is true UTC (in case the SEC fixes it)."""
+    ``double``: the value is ET wall time plus twice the UTC offset (Apple, JPM, Nvidia).
+    ``single``: the value is true UTC (Abbott, AAR).  See ``block_mode``."""
     if not text:
         return None
     try:
@@ -82,6 +87,29 @@ def accepted_et(text: str, mode: str = "double") -> datetime | None:
     if mode == "double":
         t = t.replace(tzinfo=timezone.utc).astimezone(ET)
     return t.replace(tzinfo=None)
+
+
+def block_mode(times, dates) -> str | None:
+    """How one submissions block writes its acceptance times: the wrong reading puts many
+    filings outside EDGAR's hours or after their filing date (measured on real files: 0-9
+    misplaced filings for the right reading, 55-4400 for the wrong one).  None = undecided."""
+    bad = {"double": 0, "single": 0}
+    for raw, filed in zip(times, dates, strict=False):
+        try:
+            day = date.fromisoformat(str(filed))
+        except ValueError:
+            continue
+        for mode in bad:
+            t = accepted_et(raw, mode)
+            if t is None:
+                continue
+            lag = (day - t.date()).days
+            if not (EDGAR_HOURS[0] <= t.time() <= EDGAR_HOURS[1] and 0 <= lag <= 4):
+                bad[mode] += 1
+    lo, hi = sorted(bad.values())
+    if hi >= 3 and lo <= 0.2 * hi:
+        return min(bad, key=bad.get)
+    return None
 
 
 def _sec_date(text) -> str | None:
@@ -139,7 +167,6 @@ class Edgar:
         self.interval = 1.0 / per_second
         self.sleep, self.clock = sleep, clock
         self._last = -1e18
-        self.time_mode = "double"
 
     # ----------------------------------------------------------- plumbing
     def get(self, url: str, allow_404: bool = False) -> requests.Response | None:
@@ -244,7 +271,8 @@ class Edgar:
         df = None
         with contextlib.suppress(OSError, ValueError, KeyError):
             meta = json.loads(marker.read_text())
-            if meta["since"] <= str(since) and meta["fetched"] >= str(until - timedelta(days=7)):
+            if (meta["since"] <= str(since) and meta["fetched"] >= str(until - timedelta(days=7))
+                    and meta.get("version") == 2):
                 df = pd.read_csv(path, dtype=str, keep_default_na=False)
         if df is None:
             resp = self.get(SUBMISSIONS_URL.format(name=f"CIK{int(cik):010d}.json"),
@@ -252,23 +280,48 @@ class Edgar:
             rows: list[dict] = []
             if resp is not None:
                 filings = resp.json().get("filings", {})
-                rows += _eightk_rows(int(cik), filings.get("recent", {}))
+                rows += self._block_rows(int(cik), filings.get("recent", {}))
                 for extra in filings.get("files", []):
                     if str(extra.get("filingTo", "9999")) < str(since):
                         continue
                     more = self.get(SUBMISSIONS_URL.format(name=extra["name"]), allow_404=True)
                     if more is not None:
-                        rows += _eightk_rows(int(cik), more.json())
+                        rows += self._block_rows(int(cik), more.json())
             df = pd.DataFrame(rows, columns=EIGHTK_COLUMNS).drop_duplicates("accession")
             df = df.sort_values("filed").reset_index(drop=True)
             path.parent.mkdir(parents=True, exist_ok=True)
             df.to_csv(path, index=False)
-            marker.write_text(json.dumps({"since": str(since), "fetched": str(date.today())}))
+            marker.write_text(json.dumps({"since": str(since), "fetched": str(date.today()),
+                                          "version": 2}))
         df = df[df["filed"] >= str(since)].reset_index(drop=True)
         df["cik"] = int(cik)
-        # read the raw time with the calibrated convention, never a cached interpretation
-        df["accepted_et"] = [accepted_et(x, self.time_mode) for x in df["raw_time"]]
+        df["accepted_et"] = [accepted_et(x, m) for x, m in zip(df["raw_time"], df["mode"],
+                                                               strict=True)]
         return df
+
+    def _block_rows(self, cik: int, block: dict) -> list[dict]:
+        """8-K rows of one submissions block, each tagged with the block's time format."""
+        rows = _eightk_rows(cik, block)
+        if not rows:
+            return rows
+        mode = block_mode(block.get("acceptanceDateTime") or [], block.get("filingDate") or [])
+        if mode is None:
+            mode = self._mode_from_header(cik, rows[-1]["accession"], rows[-1]["raw_time"])
+        for r in rows:
+            r["mode"] = mode
+        return rows
+
+    def _mode_from_header(self, cik: int, accession: str, raw: str) -> str:
+        """Settle an undecided block with one filing header; 'single' (the later reading)
+        when even that fails, so a mistake delays an entry instead of anticipating news."""
+        with contextlib.suppress(EdgarError):
+            truth = self.header_acceptance(cik, accession)
+            if truth is not None:
+                for mode in ("double", "single"):
+                    got = accepted_et(raw, mode)
+                    if got is not None and abs((got - truth).total_seconds()) < 120:
+                        return mode
+        return "single"
 
     def header_acceptance(self, cik: int, accession: str) -> datetime | None:
         """Acceptance time printed in the filing header (New York time)."""
@@ -279,25 +332,6 @@ class Edgar:
         m = re.search(r"<ACCEPTANCE-DATETIME>(\d{14})", resp.text[:5000])
         return datetime.strptime(m.group(1), "%Y%m%d%H%M%S") if m else None
 
-    def calibrate(self, samples: list[tuple[int, str, str]]) -> str:
-        """Check how the JSON acceptance times must be read on up to 3 (cik, accession,
-        raw JSON time) samples against their filing headers; sets and returns the mode."""
-        votes = {"double": 0, "single": 0}
-        for cik, acc, raw in samples[:3]:
-            truth = self.header_acceptance(cik, acc)
-            if truth is None:
-                continue
-            for mode in votes:
-                got = accepted_et(raw, mode)
-                if got is not None and abs((got - truth).total_seconds()) < 120:
-                    votes[mode] += 1
-        if not any(votes.values()):
-            raise EdgarError("cannot calibrate the 8-K acceptance times against the filing "
-                             "headers; the SEC may have changed its format")
-        self.time_mode = max(votes, key=votes.get)
-        log.info("8-K acceptance times read in '%s' mode (%s)", self.time_mode, votes)
-        return self.time_mode
-
 
 def _eightk_rows(cik: int, block: dict) -> list[dict]:
     out = []
@@ -307,7 +341,7 @@ def _eightk_rows(cik: int, block: dict) -> list[dict]:
     for form, filed, acc_time, acc, items in zip(*cols, strict=True):
         if form == "8-K":
             out.append({"cik": cik, "accession": acc, "filed": filed,
-                        "items": str(items or ""), "raw_time": acc_time})
+                        "items": str(items or ""), "raw_time": acc_time, "mode": ""})
     return out
 
 

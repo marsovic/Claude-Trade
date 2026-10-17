@@ -220,7 +220,7 @@ def test_insider_quarter_is_downloaded_once(tmp_path):
     assert e.insider_quarter(2024, 3, today=date(2024, 8, 1)) is None  # quarter not over
 
 
-def test_eight_ks_with_older_files_and_calibration(tmp_path):
+def test_eight_ks_read_each_company_file_in_its_own_time_format(tmp_path):
     recent = {"form": ["8-K", "4", "8-K/A", "8-K"],
               "filingDate": ["2026-07-30", "2026-07-01", "2026-06-01", "2026-04-30"],
               "acceptanceDateTime": ["2026-07-31T00:30:28.000Z", "", "",
@@ -235,18 +235,41 @@ def test_eight_ks_with_older_files_and_calibration(tmp_path):
             "recent": recent, "files": [{"name": "CIK0000000007-submissions-001.json",
                                          "filingTo": "2020-01-01"}]}})),
         ("submissions-001.json", Resp(200, body=old)),
-        ("0001-26-000018.txt", Resp(200, text="<ACCEPTANCE-DATETIME>20260730163028\n")),
+        # too few filings to vote: the header of one filing settles the recent block
         ("0001-26-000011.txt", Resp(200, text="<ACCEPTANCE-DATETIME>20260430163041\n")),
     ])
     e = Edgar(UA, cache_dir=tmp_path, session=sess, sleep=lambda s: None)
     df = e.eight_ks(7, date(2018, 1, 1), until=date(2026, 8, 1))
     assert list(df["accession"]) == ["0001-19-000001", "0001-26-000011", "0001-26-000018"]
-    assert df["accepted_et"].iloc[-1] == datetime(2026, 7, 30, 16, 30, 28)
+    assert df["accepted_et"].iloc[-1] == datetime(2026, 7, 30, 16, 30, 28)  # 'double' file
+    # the old file has no header to check: read the LATER way, never ahead of the news
+    assert df["mode"].iloc[0] == "single"
+    assert df["accepted_et"].iloc[0] == datetime(2019, 1, 29, 21, 30)
     n = len(sess.calls)
     e.eight_ks(7, date(2018, 1, 1), until=date(2026, 8, 1))
-    assert len(sess.calls) == n  # cached
-    samples = list(zip([7, 7], df["accession"].tail(2), df["raw_time"].tail(2), strict=True))
-    assert e.calibrate(samples) == "double"
+    assert len(sess.calls) == n  # cached, with each row's format
+
+
+def _block(times_et, mode):
+    """A submissions block whose acceptance times are written the given way."""
+    raw = []
+    for t in times_et:
+        utc = pd.Timestamp(t, tz="America/New_York").tz_convert("UTC")
+        if mode == "double":
+            utc = utc + (utc - pd.Timestamp(t, tz="UTC"))  # one more UTC offset
+        raw.append(utc.strftime("%Y-%m-%dT%H:%M:%S.000Z"))
+    return raw, [t[:10] for t in times_et]
+
+
+def test_time_format_is_voted_from_edgar_hours():
+    times = [f"2026-0{m}-1{d} {h:02d}:15:00" for m in (3, 5, 7) for d in (2, 4, 6)
+             for h in (6, 7, 9, 12, 16, 17, 19, 21)]
+    for mode in ("double", "single"):
+        raw, dates = _block(times, mode)
+        assert edgar.block_mode(raw, dates) == mode
+        assert accepted_et(raw[0], mode) == datetime(2026, 3, 12, 6, 15)
+    raw, dates = _block(["2026-03-12 12:00:00", "2026-03-13 13:00:00"], "single")
+    assert edgar.block_mode(raw, dates) is None  # midday only: both readings are possible
 
 
 def test_point_in_time_ticker_resolution():
@@ -461,7 +484,8 @@ def test_stocks_that_rise_anyway_do_not_pass_the_placebo():
 
 def test_verdicts():
     base = {"design_n": 300, "locked_n": 200, "design_mean": 0.02, "design_net": 0.01,
-            "design_abn": 0.025,
+            "design_abn": 0.025, "design_edge_wo_top": 0.015, "locked_edge_wo_top": 0.01,
+            "design_net_wo_top": 0.01, "locked_net_wo_top": 0.005,
             "design_p_holm": 0.001, "design_placebo_p95": 0.005, "design_placebo_p5": -0.01,
             "locked_mean": 0.015, "locked_p_pos": 0.01, "locked_p_neg": 0.99,
             "locked_net": 0.005}
@@ -470,7 +494,10 @@ def test_verdicts():
     assert "costs" in events.verdict({**base, "design_net": -0.001})
     assert events.verdict({**base, "locked_mean": -0.01}).startswith("DESIGN ONLY")
     assert "random days" in events.verdict({**base, "design_placebo_p95": 0.03})
+    assert "handful" in events.verdict({**base, "design_net_wo_top": -0.002})
+    assert "top 10" in events.verdict({**base, "locked_net_wo_top": -0.002})
     veto = {**base, "design_mean": -0.03, "design_abn": -0.02, "design_placebo_p5": -0.01,
+            "design_edge_wo_top": -0.01, "locked_edge_wo_top": -0.01,
             "locked_mean": -0.02,
             "locked_p_neg": 0.01}
     assert events.verdict(veto) == "VALIDATED VETO"
@@ -516,7 +543,7 @@ def test_grouped_store_resumes_and_is_point_in_time(tmp_path):
     class Grouped:
         calls = []
 
-        def grouped(self, day):
+        def grouped(self, day, adjusted=True):
             self.calls.append(day)
             if day >= date(2026, 10, 16):
                 raise DataNotReady("not yet")
@@ -610,11 +637,15 @@ def test_cli_point_in_time_run_with_massive(tmp_path, monkeypatch):
         def __init__(self, key):
             self.limiter = None
 
-        def grouped(self, day):
+        def grouped(self, day, adjusted=True):
+            assert adjusted is False  # as-traded bars when the split list is available
             ts = pd.Timestamp(day)
             if ts not in days:
                 return {}
             return {s: df.loc[ts].to_dict() for s, df in frames.items()}
+
+        def splits(self, start, end):
+            return []
 
     px = float(frames["S04"]["close"].iloc[100])
     buys = pd.DataFrame([{
@@ -626,8 +657,6 @@ def test_cli_point_in_time_run_with_massive(tmp_path, monkeypatch):
                             "first": "2015-01-01", "last": "2030-01-01"})
 
     class FakeEdgar:
-        time_mode = "double"
-
         def __init__(self, ua, cache_dir):
             pass
 
@@ -638,13 +667,12 @@ def test_cli_point_in_time_run_with_massive(tmp_path, monkeypatch):
             return {s: k for k, s in enumerate(frames)}
 
         def eight_ks(self, cik, since, until=None):
+            if cik == 29:
+                raise invest.edgar.EdgarError("SEC unreachable")  # one company fails
             when = datetime.combine(days[150].date(), datetime.min.time()).replace(hour=7)
             return pd.DataFrame({"cik": [cik], "accession": [f"x{cik}"],
                                  "filed": [str(days[150].date())], "items": ["2.02"],
                                  "raw_time": [""], "accepted_et": [when]})
-
-        def calibrate(self, samples):
-            return "double"
 
     monkeypatch.setattr(invest.data, "MassiveProvider", FakeMassive)
     monkeypatch.setattr(invest.edgar, "Edgar", FakeEdgar)
@@ -656,9 +684,10 @@ def test_cli_point_in_time_run_with_massive(tmp_path, monkeypatch):
     assert code == 0
     summary = json.loads((tmp_path / "out" / "summary.json").read_text())
     assert summary["funnel"]["insider_ceo_cfo"]["kept"] == 1
-    assert summary["funnel"]["earnings_jump_up"]["raw"] == 30
-    assert len(list((tmp_path / "data" / "grouped").glob("*.csv.gz"))) >= 200
-    assert "none by construction" in (tmp_path / "out" / "report.md").read_text()
+    assert summary["funnel"]["earnings_jump_up"]["raw"] == 29  # the failed one is skipped
+    assert len(list((tmp_path / "data" / "grouped_raw").glob("*.csv.gz"))) >= 200
+    report = (tmp_path / "out" / "report.md").read_text()
+    assert "none by construction" in report and "1 of 30 companies" in report
 
 
 def test_days_just_outside_the_plan_window_are_skipped(tmp_path):
@@ -670,7 +699,7 @@ def test_days_just_outside_the_plan_window_are_skipped(tmp_path):
         def __init__(self, first, hole=None):
             self.first, self.hole = first, hole
 
-        def grouped(self, day):
+        def grouped(self, day, adjusted=True):
             if day < self.first or day == self.hole:
                 raise DataError('Massive: endpoint not in your plan ({"status":"NOT_AUTHORIZED",'
                                 '"message":"Attempted to request data past historical '
@@ -689,3 +718,145 @@ def test_days_just_outside_the_plan_window_are_skipped(tmp_path):
     never = events.GroupedStore(tmp_path / "c", Window(date(2030, 1, 1)))
     with pytest.raises(DataError):  # the whole range is refused: not a boundary effect
         never.update(date(2024, 1, 1), date(2024, 12, 31))
+    assert not list((tmp_path / "c").glob("*.refused"))  # nothing remembered from a failure
+
+
+def test_a_rerun_resumes_after_days_outside_the_plan(tmp_path):
+    """The same command run again (after a crash, or the next day) must resume."""
+    from invest.data import DataError
+
+    class Edge:
+        def __init__(self, first, die_on=None):
+            self.first, self.die_on, self.calls = first, die_on, []
+
+        def grouped(self, day, adjusted=True):
+            self.calls.append(day)
+            if day == self.die_on:
+                raise OSError("Wi-Fi dropped")
+            if day < self.first:
+                raise DataError('Massive: endpoint not in your plan ({"status":"NOT_AUTHORIZED",'
+                                '"message":"past historical entitlements"})')
+            return {"AAA": {"open": 1, "high": 1, "low": 1, "close": 1, "volume": 1}}
+
+    first = Edge(date(2024, 10, 18), die_on=date(2024, 10, 23))
+    with pytest.raises(OSError):
+        events.GroupedStore(tmp_path, first).update(date(2024, 10, 16), date(2024, 10, 25))
+    again = Edge(date(2024, 10, 18))
+    events.GroupedStore(tmp_path, again).update(date(2024, 10, 16), date(2024, 10, 25))
+    assert again.calls == [date(2024, 10, 23), date(2024, 10, 24), date(2024, 10, 25)]
+    # remembered: the refused days are not asked again
+    events.GroupedStore(tmp_path, again).update(date(2024, 10, 16), date(2024, 10, 25))
+    assert len(again.calls) == 3
+    # a longer request later: the new refused days are older than every cached one
+    later = Edge(date(2024, 10, 21))
+    events.GroupedStore(tmp_path, later).update(date(2024, 10, 14), date(2024, 10, 28))
+    assert later.calls == [date(2024, 10, 14), date(2024, 10, 15), date(2024, 10, 28)]
+    assert len(list(tmp_path.glob("*.csv.gz"))) == 7
+
+
+def test_splits_adjust_returns_but_not_the_price_filter():
+    days = pd.bdate_range("2025-01-01", periods=80)
+    raw = np.full(80, 1.5)  # a $1.50 stock...
+    raw[50:] = 1.5 * 10  # ...reverse-split 1:10 on day 50 (same value, ten times the price)
+    long = pd.concat([pd.DataFrame({"date": days, "symbol": s, "open": px, "close": px,
+                                    "volume": 1e7})
+                      for s, px in (("PEN", raw), ("BIG", np.full(80, 50.0)))])
+    splits = [{"ticker": "PEN", "execution_date": str(days[50].date()), "split_from": 10,
+               "split_to": 1}]
+    p = events.panel_from_long(long, splits=splits)
+    j = p.col["PEN"]
+    assert np.allclose(p.close[:, j], 15.0)  # no fake +900 % jump in returns
+    assert p.prev_raw[40, j] == pytest.approx(1.5)  # the filter saw a $1.50 stock
+    trade = events.tradable_mask(p)
+    assert not trade[40, j] and trade[60, j]  # below $2 before the split, not after
+    assert p.dv[40, j] == pytest.approx(1.5e7)  # dollar volume as traded
+
+
+def test_massive_retries_network_errors_and_server_errors_and_pages_splits():
+    import requests
+
+    from invest.data import MassiveProvider
+
+    class Flaky:
+        def __init__(self, answers):
+            self.answers, self.headers, self.urls = answers, {}, []
+
+        def get(self, url, params=None, timeout=None):
+            self.urls.append(url)
+            a = self.answers.pop(0)
+            if isinstance(a, Exception):
+                raise a
+            return a
+
+    ok = Resp(200, body={"results": [{"T": "AAA", "o": 1, "h": 1, "l": 1, "c": 1, "v": 1}]})
+    s = Flaky([requests.exceptions.ConnectionError("down"), Resp(502, text="bad gateway"), ok])
+    p = MassiveProvider("K", session=s, sleep=lambda _: None)
+    assert p.grouped(date(2026, 1, 5), adjusted=False)["AAA"]["close"] == 1
+    page1 = Resp(200, body={"results": [{"ticker": "A", "execution_date": "2025-01-02",
+                                         "split_from": 1, "split_to": 2}],
+                            "next_url": "https://api.massive.com/v3/reference/splits?cursor=x"})
+    page2 = Resp(200, body={"results": [{"ticker": "B", "execution_date": "2025-03-02",
+                                         "split_from": 10, "split_to": 1}]})
+    s2 = Flaky([page1, page2])
+    got = MassiveProvider("K", session=s2, sleep=lambda _: None).splits(date(2025, 1, 1),
+                                                                         date(2025, 12, 31))
+    assert [x["ticker"] for x in got] == ["A", "B"]
+    assert s2.urls[1] == "https://api.massive.com/v3/reference/splits?cursor=x"
+
+
+def test_wikipedia_spikes_before_the_prices_are_not_events():
+    p = panel_from_frames(market(n_days=120, n_stocks=5, start="2024-01-01"))
+    idx = pd.date_range("2020-01-01", "2024-06-30", freq="D")
+    views = pd.Series(100.0, index=idx)
+    views[pd.Timestamp("2021-05-05")] = 9000.0  # long before the first price day
+    views[pd.Timestamp("2024-04-10")] = 9000.0
+    f = Funnel()
+    ev = events.wiki_events({"S01": views}, p, f)
+    assert len(ev) == 1 and f.counts["wiki_spike"]["raw"] == 1
+    assert f.counts["wiki_spike"]["before the first price day (not counted in raw)"] == 1
+
+
+def test_an_earlier_adjusted_download_is_converted_not_thrown_away(tmp_path):
+    import os
+
+    old = events.GroupedStore(tmp_path / "grouped", None)
+    new = events.GroupedStore(tmp_path / "grouped_raw", None, adjusted=False)
+    # downloaded on 2025-03-10 with adjusted=true: the 2-for-1 split of AAA on 2025-03-03
+    # was already folded into the 2025-02-27 bar, the one of 2025-06-02 not yet
+    pd.DataFrame({"symbol": ["AAA", "BBB"], "open": [50.0, 7.0], "high": [51.0, 7.0],
+                  "low": [49.0, 7.0], "close": [50.0, 7.0], "volume": [2000.0, 10.0]}
+                 ).to_csv(old.path(date(2025, 2, 27)), compression="gzip", index=False)
+    ts = datetime(2025, 3, 10, 20, 0).timestamp()
+    os.utime(old.path(date(2025, 2, 27)), (ts, ts))
+    splits = [{"ticker": "AAA", "execution_date": "2025-03-03", "split_from": 1, "split_to": 2},
+              {"ticker": "AAA", "execution_date": "2025-06-02", "split_from": 1, "split_to": 2}]
+    assert events.migrate_adjusted(old, new, splits) == 1
+    raw = new.load(date(2025, 1, 1), date(2025, 12, 31)).set_index("symbol")
+    assert raw.loc["AAA", "close"] == 100.0 and raw.loc["AAA", "volume"] == 1000.0
+    assert raw.loc["BBB", "close"] == 7.0
+    p = events.panel_from_long(new.load(date(2025, 1, 1), date(2025, 12, 31)), splits=splits)
+    assert p.close[0, p.col["AAA"]] == 25.0  # adjusted for both splits for returns
+    assert events.migrate_adjusted(old, new, splits) == 0  # done once
+
+
+def test_an_effect_living_in_a_few_star_stocks_is_not_validated():
+    """Hindsight lists: a few future stars drift after their events, the rest do not."""
+    frames = market(n_days=700, n_stocks=80, seed=11)
+    stars = [f"S{k:02d}" for k in range(8)]
+    picks = [(s, t) for s in stars for t in range(60, 660, 22)]
+    frames = _many_events(frames, [s for s, _ in picks], [t for _, t in picks], 0.12)
+    rng = np.random.default_rng(4)
+    others = [(f"S{k:02d}", int(t)) for k in range(5, 80, 3)
+              for t in range(60 + int(rng.integers(0, 40)), 660, 90)]
+    p = panel_from_frames(frames)
+    rows = [{"definition": "earnings_jump_up", "family": "earnings", "symbol": s,
+             "j": p.col[s], "t0": t, "public": "", "detail": ""} for s, t in picks + others]
+    f = Funnel()
+    f.add("earnings_jump_up", "raw", len(rows))
+    b = build_bench(p)
+    ev = measure(ev_frame(rows), p, b, f)
+    res = events.analyse(ev, p, b, f, locked_from=p.days[420], n_boot=2000, draws=200,
+                         meta={"hand_picked": True})
+    row = res.table.set_index("definition").loc["earnings_jump_up"]
+    assert row["design_mean"] > 0 and row["design_edge_wo_top"] < row["design_mean"] / 2
+    assert "handful" in row["verdict"] or "top 10" in row["verdict"], row["verdict"]

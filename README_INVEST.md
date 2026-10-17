@@ -308,8 +308,10 @@ Holm correction, and a DESIGN period that must hold on a LOCKED one.
 python -m invest.events --prices csv --csv-dir data_study/bars --out study_events
 
 # 2. EVERY US stock, delisted ones included, 2 years (Massive free key):
-#    ~100 min of prices + ~30 min of 8-K the first time, then minutes
-python -m invest.events --prices massive --days 730 --out study_events_massive
+#    ~100 min of prices + ~30 min of 8-K the first time, then minutes.
+#    `caffeinate -i` keeps the Mac awake; if anything stops it, run the same command
+#    again: every day and every company already downloaded is kept.
+caffeinate -i python -m invest.events --prices massive --days 730 --out study_events_massive
 
 # 3. Attention: Wikipedia history, then the study of spikes
 python -m invest.attention wiki --all-sec          # ~30 min the first time
@@ -329,18 +331,30 @@ report also shows where events were lost:
 
 ### First result: 134 large caps, 2018-2026 (run on the SEC data, survivorship-biased prices)
 
-| Definition | Events (design / locked) | Edge over the same stocks' usual days, 20 sessions | Verdict |
+Full report: `study_events_preview/report.md`. The "edge" compares each event with the same stocks on their ordinary days, over 20 sessions.
+
+| Definition | Events (design / locked) | Edge (design / locked) | Verdict |
 |---|---|---|---|
 | Insider buy ≥ 25 k$ | 276 / 173 | −0.1 % / +0.6 % | not proven |
-| CEO/CFO buy, cluster, conviction | 23 to 154 per period | from −0.7 % to +2.8 %, noise | not proven |
-| Results + jump ≥ +5 % (post-earnings drift) | 372 / 328 | **+1.6 % / +1.7 %** (Holm p = 0.050, locked p = 0.007) | not proven, **just at the threshold** |
-| Results + drop ≥ 5 % | 314 / 343 | −1.2 % / −2.5 % (locked p = 0.008) | not proven |
-| Contract / agreement (8-K 1.01) | 562 / 369 | −1.7 % / −1.1 % (locked p = 0.067) | design-only veto |
+| CEO/CFO buy, cluster, conviction | 23 to 154 per period | −0.7 % to +2.8 %, noise | not proven |
+| Results + jump ≥ +5 % (post-earnings drift) | 496 / 422 | **+1.4 % / +1.9 %** (Holm p = 0.031, locked p = 0.003) | **not proven: carried by a handful of stocks** |
+| Results + drop ≥ 5 % | 394 / 431 | −1.0 % / −2.9 % | not proven |
+| Contract / agreement (8-K 1.01) | 562 / 369 | −1.8 % / −1.1 % (locked p = 0.064) | design-only veto |
 
 What it means:
 - **Insider buying in large caps predicts nothing.** The literature finds the effect in small caps.
-- 98 % of the 49 010 insider purchases of the period are in stocks outside this list, which is why run no. 2 matters.
-- The drift after strong results is the most promising lead. It must now hold on the point-in-time universe (run no. 2) before anything changes in the bot.
+- The drift after strong results passes every test except one:
+  - SMCI, PLTR, TSLA, HIMS, CRWD and a few other of today's stars carry it;
+  - without its 10 best stocks it no longer pays its costs;
+  - on a list chosen in 2026, those stocks may be stars *because* of those rallies.
+  
+  Only the point-in-time run (no. 2) can tell a real effect from hindsight.
+- 98 % of the 49 010 insider purchases of the period are in stocks outside this list, which is another reason why run no. 2 matters.
+
+How the tool treats such cases:
+- An effect must survive without its 10 biggest contributors, and still pay its costs if it is a buy.
+- On a hand-picked list (`--prices csv` or `tiingo`), a VALIDATED verdict says "confirm with --prices massive".
+- Each company's SEC file is read in its own time format: the SEC writes two different ones. The first version of this preview read every company like Apple, which shifted some filings by 4-5 hours.
 
 ## 8. Honest limitations
 

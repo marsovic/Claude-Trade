@@ -7,6 +7,7 @@
    "earnings",
    "filings"
   ],
+  "hand_picked": true,
   "first_day": "2018-07-30",
   "last_day": "2026-10-16",
   "symbols": 133,
@@ -50,17 +51,17 @@
   "earnings_jump_up": {
    "raw": 3941,
    "no price history for the ticker": 135,
-   "reaction below the threshold or not measurable": 3100,
-   "repeat within 20 sessions of a counted one": 5,
-   "kept": 701
+   "reaction below the threshold or not measurable": 2880,
+   "repeat within 20 sessions of a counted one": 7,
+   "kept": 919
   },
   "earnings_jump_down": {
    "raw": 3941,
    "no price history for the ticker": 135,
-   "reaction below the threshold or not measurable": 3138,
+   "reaction below the threshold or not measurable": 2967,
    "not tradable at t0 (no bar, price < $2 or volume < $1M/day)": 2,
-   "repeat within 20 sessions of a counted one": 8,
-   "kept": 658
+   "repeat within 20 sessions of a counted one": 11,
+   "kept": 826
   },
   "agreement_8k": {
    "raw": 1279,
@@ -72,9 +73,9 @@
   "news_jump_8k": {
    "raw": 4855,
    "no price history for the ticker": 260,
-   "reaction below the threshold or not measurable": 4340,
-   "repeat within 20 sessions of a counted one": 35,
-   "kept": 220
+   "reaction below the threshold or not measurable": 4349,
+   "repeat within 20 sessions of a counted one": 32,
+   "kept": 214
   }
  },
  "verdicts": {
@@ -82,7 +83,7 @@
   "insider_cluster": "NOT PROVEN (only 23 design events, 100 needed)",
   "insider_ceo_cfo": "NOT PROVEN (only 70 design events, 100 needed)",
   "insider_conviction": "NOT PROVEN (design effect not significant after Holm)",
-  "earnings_jump_up": "NOT PROVEN (design effect not significant after Holm)",
+  "earnings_jump_up": "NOT PROVEN (carried by a handful of stocks: without the top 10 it does not pay its costs)",
   "earnings_jump_down": "NOT PROVEN (design effect not significant after Holm)",
   "agreement_8k": "DESIGN ONLY veto (did not hold in the locked period)",
   "news_jump_8k": "NOT PROVEN (design effect not significant after Holm)"
