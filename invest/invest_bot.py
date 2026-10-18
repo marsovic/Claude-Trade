@@ -38,6 +38,7 @@ from invest import __version__
 from invest.brokers.base import BrokerError
 from invest.config import LIVE_CONFIRMATION, ConfigError, InvestSettings
 from invest.data import ET, load_market_data
+from invest.edgar import Edgar, FeedNotReady, InsiderFeed
 from invest.engine import Engine
 from invest.execution import LiveExecution, SimExecution
 from invest.markets import is_trading_day, next_trading_day
@@ -116,10 +117,16 @@ class InvestBot:
         elif state.mode != s.mode:
             raise ConfigError(f"{self.store.dir} holds a {state.mode!r} state but the bot "
                               f"runs as {s.mode!r}: use another INV_STATE_DIR.")
+        elif (state.strategy or "momentum") != s.strategy and (state.positions or
+                                                               state.stats.get("trades")):
+            raise ConfigError(f"{self.store.dir} belongs to the {state.strategy or 'momentum'} "
+                              f"strategy, not {s.strategy}: use another INV_STATE_DIR.")
         else:
             self.store.log_decision("start", f"resumed, {len(state.positions)} position(s)")
         state.status = "dead" if self.winding_down else "running"
-        state.universe = build_universe(s.universe or None, s.exclude)
+        state.strategy = s.strategy
+        state.universe = ([] if s.strategy == "insider"
+                          else build_universe(s.universe or None, s.exclude))
         state.settings = s.public_dict()
         self.state = state
         if s.broker == "sim":
@@ -134,8 +141,16 @@ class InvestBot:
             self.execution.refresh_account()
         if self.research is None and s.sentiment_enabled:
             self.research = Research(s, clock=self.clock)
-        self.engine = Engine(s, state, self.store, self.execution, research=self.research,
-                             ledger=self.ledger)
+        if s.strategy == "insider":
+            from invest.insider import InsiderEngine
+
+            edgar = Edgar(s.sec_user_agent, cache_dir=Path(s.data_dir) / "sec")
+            self.engine = InsiderEngine(s, state, self.store, self.execution,
+                                        InsiderFeed(edgar), edgar, research=None,
+                                        ledger=self.ledger)
+        else:
+            self.engine = Engine(s, state, self.store, self.execution,
+                                 research=self.research, ledger=self.ledger)
         self.store.save(state)
 
     # ============================================================ daily job
@@ -145,9 +160,49 @@ class InvestBot:
             s, symbols, end, fx_fallback=st.fx_rate or None,
             last_day=date.fromisoformat(st.last_day) if st.last_day else None)
 
+    def eod_delay(self) -> int:
+        """Minutes after the close before the daily job: the insider strategy waits for
+        the SEC's daily index of the session (published in the evening, New York time)."""
+        if self.s.strategy == "insider":
+            return max(self.s.eod_delay_minutes, 360)
+        return self.s.eod_delay_minutes
+
+    def insider_daily_job(self) -> bool:
+        """The latest closed session, once its Form 4 filings are published."""
+        s, st = self.s, self.state
+        now = self.now_et()
+        today = now.date()
+        bench = self.data_loader(s, [s.benchmark], today).bars.get(s.benchmark)
+        if bench is None or bench.empty:
+            raise RuntimeError(f"no {s.benchmark} bars from the data provider")
+        last = pd.Timestamp(st.last_day) if st.last_day else None
+        days = [d for d in bench.index if last is None or d > last]
+        ready = datetime.combine(today, SESSION_CLOSE, tzinfo=ET) + timedelta(
+            minutes=self.eod_delay())
+        if now < ready:
+            days = [d for d in days if d.date() < today]
+        if not days:
+            return False
+        day = days[-1]  # filings of skipped days are still read (days_to_scan)
+        try:
+            symbols = self.engine.prepare(day.date(), now)
+        except FeedNotReady as exc:
+            if st.last_scan.get("waiting") != str(day.date()):
+                self.store.log_decision("info", f"{exc}: retrying every 15 minutes")
+                st.last_scan["waiting"] = str(day.date())
+            return False
+        data = self.data_loader(s, list(dict.fromkeys([s.benchmark] + symbols)), today)
+        self.engine.process_day(day, data)
+        nxt = next_trading_day(pd.Timestamp(day).date())
+        st.next_scan_at = int(datetime.combine(nxt, SESSION_CLOSE, tzinfo=ET).timestamp()
+                              * 1000) + self.eod_delay() * 60_000
+        return True
+
     def daily_job(self) -> bool:
         """Process every new closed day (simulator) or the latest one (real broker)."""
         s, st = self.s, self.state
+        if s.strategy == "insider":
+            return self.insider_daily_job()
         now = self.now_et()
         today = now.date()
         symbols = data_symbols(st.universe, s.benchmark,
@@ -190,7 +245,7 @@ class InvestBot:
             return False  # the last close is processed; wait for the next one
         if not is_trading_day(now.date()):
             return True  # weekend or NYSE holiday: catch up any missed close
-        after_close = (now + timedelta(minutes=-self.s.eod_delay_minutes)).time() >= SESSION_CLOSE
+        after_close = (now + timedelta(minutes=-self.eod_delay())).time() >= SESSION_CLOSE
         return after_close or now.time() < SESSION_OPEN
 
     # ============================================================= intraday
@@ -280,8 +335,8 @@ class InvestBot:
         self.setup()
         if self.winding_down:
             return self.wind_down()
-        log.info("invest bot started: %s, equity %.2f EUR, %d stocks", self.s.mode,
-                 self.state.equity, len(self.state.universe))
+        log.info("invest bot started: %s, %s strategy, equity %.2f EUR", self.s.mode,
+                 self.s.strategy, self.state.equity)
         while self.running:
             try:
                 alive = self.cycle()
@@ -340,6 +395,8 @@ def main(argv=None) -> int:
     p = argparse.ArgumentParser(description="Survival investment bot (stocks, no crypto)")
     p.add_argument("--broker", choices=["sim", "trading212", "ibkr", "alpaca"])
     p.add_argument("--environment", choices=["paper", "live"])
+    p.add_argument("--strategy", choices=["momentum", "insider"],
+                   help="insider = buy after SEC insider purchases (README_INVEST.md s.7)")
     p.add_argument("--state-dir")
     p.add_argument("--once", action="store_true", help="process the last close and exit")
     p.add_argument("--env-file", default=".env")
@@ -347,7 +404,7 @@ def main(argv=None) -> int:
     p.add_argument("-v", "--verbose", action="store_true")
     args = p.parse_args(argv)
     overrides = {"broker": args.broker, "environment": args.environment,
-                 "state_dir": args.state_dir}
+                 "state_dir": args.state_dir, "strategy": args.strategy}
     if args.i_understand_the_risks:
         overrides["live_trading"] = LIVE_CONFIRMATION
     try:
@@ -364,7 +421,12 @@ def main(argv=None) -> int:
 
     signal.signal(signal.SIGINT, stop)
     signal.signal(signal.SIGTERM, stop)
-    if s.is_live:
+    if s.is_live and s.strategy == "insider":
+        log.warning("REAL MONEY on %s: capital %.2f EUR, %d equal slots, insider strategy.",
+                    s.broker, s.initial_capital, s.insider_slots)
+        log.warning("The insider rule was validated on 2 years of data only (README_INVEST.md, "
+                    "section 7): most single trades end near zero. Paper trading first.")
+    elif s.is_live:
         log.warning("REAL MONEY on %s: capital %.2f EUR, %.0f%% risk per trade, %d slots.",
                     s.broker, s.initial_capital, s.risk_per_trade * 100, s.slots)
         log.warning("No edge has been demonstrated: on 2019-2026 data this strategy returned "

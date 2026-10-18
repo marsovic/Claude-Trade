@@ -12,6 +12,8 @@ state_v1.json
 # Backtests and downloaded market data
 backtest_results/
 data/
+# the bot's SEC caches (re-downloaded when missing)
+data_invest/sec/
 
 # Python
 __pycache__/

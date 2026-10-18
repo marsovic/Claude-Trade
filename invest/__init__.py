@@ -1,4 +1,4 @@
-"""Aggressive momentum investment bot for stocks and ETPs (no crypto).
+"""Stock investment bots (no crypto) and their research tools.
 
 Starts with 100 EUR. If it loses them, it stops forever.
 """

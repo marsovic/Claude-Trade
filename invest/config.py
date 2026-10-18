@@ -187,6 +187,19 @@ class InvestSettings:
     poll_seconds: int = 60
     eod_delay_minutes: int = 30  # after the 16:00 ET close before fetching bars
 
+    # --- Strategy -------------------------------------------------------------------
+    # momentum: the original 7-condition breakout bot (no edge found, README_INVEST s.6)
+    # insider: buys after SEC insider purchases, the rule validated by invest.events (s.7)
+    strategy: str = "momentum"
+    insider_rules: list[str] = field(default_factory=lambda: ["ceo_cfo", "conviction", "buy"])
+    insider_slots: int = 4  # equal-weight positions
+    insider_hold_days: int = 20  # sessions, as measured by the event study
+    insider_stop_pct: float = 0.35  # disaster stop only: the study had no stop
+    insider_entry_gap: float = 0.08  # buy limit = last close * (1 + gap)
+    insider_min_price: float = 2.0  # USD, last close
+    insider_min_dollar_volume: float = 1_000_000.0  # USD, mean of the last 20 sessions
+    insider_veto_days: int = 20  # sessions after an 8-K 1.01 or an earnings drop
+
     # --- Secrets (conventional env names, see SECRET_ENV) ---------------------------
     t212_api_key: str = ""
     t212_api_secret: str = ""
@@ -243,6 +256,22 @@ class InvestSettings:
         if unknown or not self.entry_conditions:
             raise ConfigError(f"INV_ENTRY_CONDITIONS: unknown {unknown or 'empty list'}; "
                               f"choose among {', '.join(CONDITIONS)}")
+        self.strategy = self.strategy.strip().lower()
+        self.insider_rules = [r.strip().lower() for r in self.insider_rules if r.strip()]
+        if self.strategy not in ("momentum", "insider"):
+            raise ConfigError("INV_STRATEGY must be momentum or insider")
+        bad_rules = [r for r in self.insider_rules if r not in ("ceo_cfo", "conviction", "buy")]
+        if bad_rules or not self.insider_rules:
+            raise ConfigError("INV_INSIDER_RULES: choose among ceo_cfo, conviction, buy")
+        if self.strategy == "insider":
+            if not 1 <= self.insider_slots <= 10:
+                raise ConfigError("INV_INSIDER_SLOTS must be 1..10")
+            if not 0.05 <= self.insider_stop_pct <= 0.9 or self.insider_hold_days < 1:
+                raise ConfigError("INV_INSIDER_STOP_PCT in [0.05, 0.9], HOLD_DAYS >= 1")
+            if "@" not in self.sec_user_agent:
+                raise ConfigError('the insider strategy reads SEC filings: set SEC_USER_AGENT='
+                                  '"Firstname Lastname you@example.com" in .env')
+            self.etp_enabled = False  # one strategy at a time
         if self.broker not in BROKERS:
             raise ConfigError(f"INV_BROKER must be one of {BROKERS}")
         if self.environment not in ENVIRONMENTS:
@@ -297,7 +326,8 @@ class InvestSettings:
             "currency_symbol": "€",
             "exposure_label": "invested",
             "mode": self.mode,
-            "max_open_positions": self.slots + (1 if self.etp_enabled else 0),
+            "max_open_positions": (self.insider_slots if self.strategy == "insider" else
+                                   self.slots + (1 if self.etp_enabled else 0)),
         })
         return out
 

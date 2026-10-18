@@ -195,6 +195,57 @@ class Engine:
     def process_day(self, day: pd.Timestamp, data, panel: dict | None = None) -> dict:
         s, st = self.s, self.state
         day = pd.Timestamp(day).normalize()
+        equity, close_ts, dead = self._start_day(day, data)
+        if dead:
+            return {"dead": True, "equity": equity}
+
+        # 3) signals
+        panel = panel if panel is not None else build_panel(data.bars, st.universe, s)
+        regime = regime_at(day, data.bars, data.vix, data.vix3m, s)
+        was_on = st.regime.get("on") if st.regime else None
+        st.regime = regime.to_dict()
+        evals = evaluate_day(panel, day, regime, s)
+        budget = risk_budget(equity, st.drawdown(), s, previous_level=st.dd_level)
+        if budget.level != st.dd_level:
+            self._log("risk", f"drawdown {st.drawdown():.0%}: ladder level {st.dd_level} -> "
+                      f"{budget.level}", ts=close_ts)
+            st.dd_level = budget.level
+        research_ok = self.research is not None and s.sentiment_enabled
+        earnings = self.research.earnings_dates(day.date()) if research_ok else {}
+
+        # 4) manage positions
+        exiting = set()
+        for sym, pos in list(st.positions.items()):
+            if pos.sleeve == "etp":
+                reason = self._manage_etp(day, data, pos, regime)
+            else:
+                reason = self._manage_stock(day, pos, panel.get(sym), evals.get(sym), regime,
+                                            earnings, equity)
+            if reason:
+                exiting.add(sym)
+                self._exit(sym, pos, reason, day)
+
+        # 5) entries
+        entered = []
+        if regime.on and not st.daily_halt:
+            entered = self._enter_stocks(day, evals, panel, budget, equity, earnings, exiting)
+        if regime.on != was_on:  # log regime changes, not every day
+            self._log("regime", "risk-on: new entries allowed" if regime.on else
+                      "risk-off, no new stock entry: " + "; ".join(regime.reasons), ts=close_ts)
+        if s.etp_enabled and budget.etp_allowed and not st.daily_halt:
+            self._enter_etp(day, data, regime, budget, equity)
+
+        # 6) snapshot
+        self._snapshot(day, evals, regime, close_ts)
+        st.heartbeat = close_ts
+        return {"equity": equity, "regime_on": regime.on, "entries": entered,
+                "exits": sorted(exiting)}
+
+    def _start_day(self, day: pd.Timestamp, data) -> tuple[float, int, bool]:
+        """Steps 1-2, shared by every strategy: settle, mark, survival rule, pauses.
+        Returns (equity, close timestamp, dead)."""
+        s, st = self.s, self.state
+        day = pd.Timestamp(day).normalize()
         self.day = day
         self.fx_now = data.fx(day)
         st.fx_rate = self.fx_now
@@ -239,7 +290,7 @@ class Engine:
         # 2) survival rule and pauses
         if equity <= s.survival_floor:
             self.die(day, equity, close_ts)
-            return {"dead": True, "equity": equity}
+            return equity, close_ts, True
         week = f"{day.isocalendar().year}-{day.isocalendar().week}"
         if week != st.week_id:
             # Reference = last close of the previous week, so Monday gaps count.
@@ -259,47 +310,7 @@ class Engine:
                       "paused", ts=close_ts)
         st.daily_halt = self._paused(day) or fee_halt or suspicious
 
-        # 3) signals
-        panel = panel if panel is not None else build_panel(data.bars, st.universe, s)
-        regime = regime_at(day, data.bars, data.vix, data.vix3m, s)
-        was_on = st.regime.get("on") if st.regime else None
-        st.regime = regime.to_dict()
-        evals = evaluate_day(panel, day, regime, s)
-        budget = risk_budget(equity, st.drawdown(), s, previous_level=st.dd_level)
-        if budget.level != st.dd_level:
-            self._log("risk", f"drawdown {st.drawdown():.0%}: ladder level {st.dd_level} -> "
-                      f"{budget.level}", ts=close_ts)
-            st.dd_level = budget.level
-        research_ok = self.research is not None and s.sentiment_enabled
-        earnings = self.research.earnings_dates(day.date()) if research_ok else {}
-
-        # 4) manage positions
-        exiting = set()
-        for sym, pos in list(st.positions.items()):
-            if pos.sleeve == "etp":
-                reason = self._manage_etp(day, data, pos, regime)
-            else:
-                reason = self._manage_stock(day, pos, panel.get(sym), evals.get(sym), regime,
-                                            earnings, equity)
-            if reason:
-                exiting.add(sym)
-                self._exit(sym, pos, reason, day)
-
-        # 5) entries
-        entered = []
-        if regime.on and not st.daily_halt:
-            entered = self._enter_stocks(day, evals, panel, budget, equity, earnings, exiting)
-        if regime.on != was_on:  # log regime changes, not every day
-            self._log("regime", "risk-on: new entries allowed" if regime.on else
-                      "risk-off, no new stock entry: " + "; ".join(regime.reasons), ts=close_ts)
-        if s.etp_enabled and budget.etp_allowed and not st.daily_halt:
-            self._enter_etp(day, data, regime, budget, equity)
-
-        # 6) snapshot
-        self._snapshot(day, evals, regime, close_ts)
-        st.heartbeat = close_ts
-        return {"equity": equity, "regime_on": regime.on, "entries": entered,
-                "exits": sorted(exiting)}
+        return equity, close_ts, False
 
     # -------------------------------------------------------------- stocks
     def _manage_stock(self, day, pos, feats, ev, regime, earnings, equity) -> str | None:

@@ -1,7 +1,7 @@
 [project]
-name = "survival-trading-bot"
-version = "2.0.0"
-description = "Open-source Binance futures trading bot that starts with 50 USDT and stops forever if it loses them."
+name = "claude-trade"
+version = "1.0.0"
+description = "Small-capital trading bots (US stocks, crypto) with a survival rule, and the research tools that test their rules."
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.10"

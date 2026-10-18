@@ -1,4 +1,4 @@
-# Survival Investment Bot — stocks & ETPs, no crypto
+# Survival Investment Bots — US stocks, no crypto
 
 The same idea as the crypto bot, applied to **investments**:
 
@@ -376,6 +376,51 @@ How the tool treats such cases:
 - An effect must survive without its 10 biggest contributors, and still pay its costs if it is a buy.
 - On a hand-picked list (`--prices csv` or `tiingo`), a VALIDATED verdict says "confirm with --prices massive".
 - Each company's SEC file is read in its own time format: the SEC writes two different ones. The first version of this preview read every company like Apple, which shifted some filings by 4-5 hours.
+
+### Trading it: the insider bot (`invest/insider.py`, `INV_STRATEGY=insider`)
+
+The bot trades the validated rules with the same thresholds as the study.
+
+Each US session, once the SEC has published that day's filings (late evening, New York time):
+
+1. **Read** every Form 4 filed that day. That is about 500 filings, 1-2 minutes at the SEC's rate limit.
+2. **Keep** the open-market purchases matching `INV_INSIDER_RULES`, best rule first:
+   - `ceo_cfo`: the CEO or CFO buys ≥ 50 k$;
+   - `conviction`: an officer buys ≥ 100 k$ and raises the holding by 20 %;
+   - `buy`: an officer or director buys ≥ 25 k$.
+
+   Purchases under a 10b5-1 plan are ignored.
+3. **Check** each candidate; all must hold:
+   - last close ≥ 2 $;
+   - ≥ 1 M$ traded a day;
+   - insider price close to the market price;
+   - no 8-K item 1.01 and no 5 % earnings drop in the last 20 sessions (the validated vetoes);
+   - tradable at the broker;
+   - a free slot.
+4. **Buy** at the next open:
+   - limit at the last close + 8 %;
+   - equal weight across `INV_INSIDER_SLOTS` (4: about 25 € each);
+   - disaster stop at −35 % (the study had no stop).
+5. **Sell** at the open after 20 sessions (`INV_INSIDER_HOLD_DAYS`).
+
+Survival rule, weekly loss pause and fee halt are unchanged. The dashboard shows every
+candidate of the day with its checks, and the journal says why each one was or was not
+bought.
+
+```bash
+python -m invest.invest_bot --strategy insider --broker sim --once     # one test run
+python -m invest.invest_bot --strategy insider --broker trading212 \
+    --environment paper --state-dir state_insider_trading212           # T212 demo
+scripts/macos/install.sh                     # same, in the background on a Mac
+```
+
+Before trusting it with real money:
+- the study covers two years only;
+- the median trade is about zero;
+- the edge is largest in the least liquid stocks, where spreads can exceed the 1 % modelled;
+- Trading 212 does not list every small cap.
+
+Compare the demo's fills with the study's assumptions for a few months.
 
 ## 8. Honest limitations
 

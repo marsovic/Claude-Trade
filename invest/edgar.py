@@ -32,6 +32,7 @@ from datetime import time as dtime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import numpy as np
 import pandas as pd
 import requests
 
@@ -45,6 +46,8 @@ INSIDER_ZIP = ("https://www.sec.gov/files/structureddata/data/insider-transactio
 TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
 SUBMISSIONS_URL = "https://data.sec.gov/submissions/{name}"
 FILING_TXT = "https://www.sec.gov/Archives/edgar/data/{cik}/{acc_plain}/{acc}.txt"
+DAILY_INDEX = "https://www.sec.gov/Archives/edgar/daily-index/{y}/QTR{q}/form.{ymd}.idx"
+ARCHIVE = "https://www.sec.gov/Archives/{path}"
 
 PURCHASE_COLUMNS = ["accession", "filed", "traded", "cik", "symbol", "owner_cik", "owner",
                     "role", "officer", "director", "owner10", "shares", "value", "price",
@@ -261,17 +264,19 @@ class Edgar:
                 out[sym] = int(v["cik_str"])
         return out
 
-    def eight_ks(self, cik: int, since: date, until: date | None = None) -> pd.DataFrame:
+    def eight_ks(self, cik: int, since: date, until: date | None = None,
+                 max_age_days: int = 7) -> pd.DataFrame:
         """Every 8-K of a company since ``since`` with items and New York acceptance time.
-        Cached per company; fetched again only when the cache stops more than a week
-        before ``until`` or starts after ``since``."""
+        Cached per company; fetched again when the cache was taken more than
+        ``max_age_days`` before ``until`` (0 for live decisions) or starts after ``since``."""
         path = self.dir / "8k" / f"{int(cik)}.csv"
         marker = path.parent / f"{int(cik)}.json"
         until = until or date.today()
         df = None
         with contextlib.suppress(OSError, ValueError, KeyError):
             meta = json.loads(marker.read_text())
-            if (meta["since"] <= str(since) and meta["fetched"] >= str(until - timedelta(days=7))
+            fresh_from = str(until - timedelta(days=max_age_days))
+            if (meta["since"] <= str(since) and meta["fetched"] >= fresh_from
                     and meta.get("version") == 2):
                 df = pd.read_csv(path, dtype=str, keep_default_na=False)
         if df is None:
@@ -421,6 +426,148 @@ def parse_form345(content: bytes) -> tuple[pd.DataFrame, pd.DataFrame]:
     out = df.reset_index().rename(columns={"ACCESSION_NUMBER": "accession"})
     out = out[PURCHASE_COLUMNS].sort_values(["filed", "accession"]).reset_index(drop=True)
     return out, issuers
+
+
+# ============================================================== live Form 4 feed
+_IDX_LINE = re.compile(r"^(?P<form>\S+(?: \S+)*)\s{2,}(?P<company>.+?)\s{2,}(?P<cik>\d+)\s{2,}"
+                       r"(?P<date>\d{8})\s{2,}(?P<path>edgar/\S+)\s*$")
+
+
+def parse_daily_index(text: str, forms: tuple[str, ...] = ("4",)) -> list[dict]:
+    """Rows of an EDGAR daily form index for the given form types, one per filing (the
+    index lists a Form 4 once under the issuer and once under each reporting owner)."""
+    out, seen = [], set()
+    for line in text.splitlines():
+        m = _IDX_LINE.match(line)
+        if not m or m["form"] not in forms:
+            continue
+        acc = m["path"].rsplit("/", 1)[-1].removesuffix(".txt")
+        if acc in seen:  # same filing under the issuer's and the owner's folder
+            continue
+        seen.add(acc)
+        out.append({"form": m["form"], "path": m["path"], "accession": acc,
+                    "filed": f"{m['date'][:4]}-{m['date'][4:6]}-{m['date'][6:]}"})
+    return out
+
+
+def _x(node, path: str) -> str:
+    """Text of ``path/value`` or ``path`` under an XML node ('' when missing)."""
+    if node is None:
+        return ""
+    el = node.find(path + "/value")
+    if el is None:
+        el = node.find(path)
+    return (el.text or "").strip() if el is not None and el.text else ""
+
+
+def _true(text: str) -> bool:
+    return text.strip().lower() in ("1", "true", "y", "yes")
+
+
+def parse_form4(text: str, accession: str, filed: str) -> dict | None:
+    """One open-market purchase row (PURCHASE_COLUMNS) from a Form 4 submission, or None
+    when the filing holds no purchase of shares.  Same rules as ``parse_form345``."""
+    import xml.etree.ElementTree as ElementTree
+
+    start, end = text.find("<ownershipDocument"), text.find("</ownershipDocument>")
+    if start < 0 or end < 0:
+        return None
+    try:
+        root = ElementTree.fromstring(text[start:end + len("</ownershipDocument>")])
+    except ElementTree.ParseError:
+        return None
+    if _x(root, "documentType") != "4":
+        return None
+    symbol = clean_symbol(_x(root, "issuer/issuerTradingSymbol"))
+    cik = _x(root, "issuer/issuerCik")
+    if not symbol or not cik.isdigit():
+        return None
+    shares = value = 0.0
+    traded, owned = "", []
+    for tx in root.iter("nonDerivativeTransaction"):
+        title = _x(tx, "securityTitle").lower()
+        if any(w in title for w in _NOT_SHARES):
+            continue
+        if _x(tx, "transactionCoding/transactionCode") != "P":
+            continue
+        if _x(tx, "transactionAmounts/transactionAcquiredDisposedCode") not in ("A", ""):
+            continue
+        try:
+            q = float(_x(tx, "transactionAmounts/transactionShares"))
+            px = float(_x(tx, "transactionAmounts/transactionPricePerShare"))
+        except ValueError:
+            continue
+        if q <= 0 or px <= 0:
+            continue
+        shares += q
+        value += q * px
+        traded = max(traded, _sec_date(_x(tx, "transactionDate")) or "")
+        with contextlib.suppress(ValueError):
+            after = float(_x(tx, "postTransactionAmounts/sharesOwnedFollowingTransaction"))
+            direct = _x(tx, "ownershipNature/directOrIndirectOwnership").upper() == "D"
+            owned.append((direct, after))
+    if shares <= 0:
+        return None
+    owner = root.find("reportingOwner")
+    rel = owner.find("reportingOwnerRelationship") if owner is not None else None
+    flags = {k: _true(_x(rel, k)) for k in ("isDirector", "isOfficer", "isTenPercentOwner")}
+    relationship = ",".join(n for k, n in (("isDirector", "Director"), ("isOfficer", "Officer"),
+                                           ("isTenPercentOwner", "TenPercentOwner"))
+                            if flags[k])
+    title = _x(rel, "officerTitle")
+    role = role_of(relationship, title)
+    direct = [a for d, a in owned if d]
+    owned_after = max(direct) if direct else (max(a for _, a in owned) if owned else np.nan)
+    before = owned_after - shares if np.isfinite(owned_after) else np.nan
+    delta = shares / before if np.isfinite(before) and before > 0 else 10.0
+    return {"accession": accession, "filed": filed, "traded": traded or filed,
+            "cik": int(cik), "symbol": symbol,
+            "owner_cik": _x(owner, "reportingOwnerId/rptOwnerCik").lstrip("0"),
+            "owner": _x(owner, "reportingOwnerId/rptOwnerName"), "role": role,
+            "officer": flags["isOfficer"] or role in ("ceo", "cfo"),
+            "director": flags["isDirector"], "owner10": flags["isTenPercentOwner"],
+            "shares": shares, "value": value, "price": value / shares,
+            "owned_after": owned_after, "delta_own": min(delta, 10.0),
+            "plan": _true(_x(root, "aff10b5One"))}
+
+
+class FeedNotReady(EdgarError):
+    """The SEC has not published the daily index of that day yet."""
+
+
+class InsiderFeed:
+    """Open-market purchases filed on one business day, from the EDGAR daily index and each
+    Form 4 (about 500 filings a day: 1-2 minutes at the SEC's rate limit), cached."""
+
+    def __init__(self, edgar: Edgar):
+        self.edgar = edgar
+        self.dir = edgar.dir / "form4_daily"
+        self.dir.mkdir(parents=True, exist_ok=True)
+
+    def purchases_on(self, day: date) -> pd.DataFrame:
+        path = self.dir / f"{day}.csv"
+        if path.exists():
+            return pd.read_csv(path, dtype={"symbol": str, "owner_cik": str,
+                                            "accession": str})
+        q = (day.month - 1) // 3 + 1
+        resp = self.edgar.get(DAILY_INDEX.format(y=day.year, q=q, ymd=day.strftime("%Y%m%d")),
+                              allow_404=True)
+        if resp is None:
+            raise FeedNotReady(f"SEC daily index of {day} not published yet")
+        rows = []
+        for f in parse_daily_index(resp.text):
+            doc = self.edgar.get(ARCHIVE.format(path=f["path"]), allow_404=True)
+            if doc is None:
+                continue
+            row = parse_form4(doc.text, f["accession"], f["filed"])
+            if row is not None:
+                rows.append(row)
+        df = pd.DataFrame(rows, columns=PURCHASE_COLUMNS)
+        tmp = path.with_suffix(".tmp")
+        df.to_csv(tmp, index=False)
+        tmp.replace(path)
+        log.info("SEC Form 4 of %s: %d open-market purchase(s)", day, len(df))
+        return df
 
 
 def symbol_resolver(issuers: pd.DataFrame, current: dict[str, int] | None = None):

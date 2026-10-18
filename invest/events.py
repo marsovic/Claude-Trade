@@ -67,6 +67,9 @@ MIN_LOCKED = 50
 ALPHA = 0.05
 PLACEBO_WINDOW = 126  # sessions on each side of a real event where its placebo is drawn
 TOP_K = 10  # an edge must survive without the stocks that contribute most to it
+# insider definitions (USD of shares bought in one Form 4); the live strategy uses them too
+BUY_MIN, CEO_CFO_MIN, CONVICTION_MIN, CONVICTION_DELTA, CLUSTER_MIN = (
+    25_000, 50_000, 100_000, 0.20, 10_000)
 
 
 @dataclass(frozen=True)
@@ -423,10 +426,10 @@ def insider_events(buys: pd.DataFrame, p: Panel, funnel: Funnel) -> pd.DataFrame
     v = b["value"].astype(float)
     d = b["delta_own"].astype(float)
     picks = {
-        "insider_buy": b[v >= 25_000],
-        "insider_ceo_cfo": b[b["role"].isin(["ceo", "cfo"]) & (v >= 50_000)],
-        "insider_conviction": b[(v >= 100_000) & (d >= 0.20)],
-        "insider_cluster": _clusters(b[v >= 10_000]),
+        "insider_buy": b[v >= BUY_MIN],
+        "insider_ceo_cfo": b[b["role"].isin(["ceo", "cfo"]) & (v >= CEO_CFO_MIN)],
+        "insider_conviction": b[(v >= CONVICTION_MIN) & (d >= CONVICTION_DELTA)],
+        "insider_cluster": _clusters(b[v >= CLUSTER_MIN]),
     }
     out = []
     for name, df in picks.items():
