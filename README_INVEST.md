@@ -381,7 +381,7 @@ How the tool treats such cases:
 
 The bot trades the validated rules with the same thresholds as the study.
 
-Each US session, once the SEC has published that day's filings (late evening, New York time):
+Each US session, once the SEC has published that day's filings (about 22:00 New York time, 04:00 in Paris):
 
 1. **Read** every Form 4 filed that day. That is about 500 filings, 1-2 minutes at the SEC's rate limit.
 2. **Keep** the open-market purchases matching `INV_INSIDER_RULES`, best rule first:

@@ -54,7 +54,9 @@ CHECKS = ("rule", "price", "liquidity", "price_check", "no_veto", "tradable", "s
 CHECK_LABELS = ("insider rule", "price >= $2", "volume >= $1M/day", "insider price ~ market",
                 "no 8-K 1.01 / earnings drop", "tradable", "free slot")
 MAX_CATCH_UP = 10  # business days of filings read at most after a long stop
-INDEX_GRACE = timedelta(hours=36)  # a daily index still missing after that: no filings
+# the SEC publishes a day's index at about 22:02 New York time; still missing 8 hours later
+# (before the open), or missing for an older day: a holiday, no filings
+INDEX_GRACE = timedelta(hours=8)
 
 
 def matching_rules(row, allowed) -> list[str]:
@@ -98,7 +100,7 @@ class InsiderEngine(Engine):
                 frames.append(self.feed.purchases_on(d))
             except FeedNotReady:
                 end_of_day = datetime.combine(d, dtime(22, 0))
-                if now_et.replace(tzinfo=None) < end_of_day + INDEX_GRACE:
+                if d == day and now_et.replace(tzinfo=None) < end_of_day + INDEX_GRACE:
                     raise
                 log.info("no SEC daily index for %s (federal holiday?): no filings", d)
         buys = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
@@ -155,6 +157,9 @@ class InsiderEngine(Engine):
             checks["rule"] = True
             values = {"value_k": round(float(c["value"]) / 1000, 1)}
             why = self._check(c, day, data, sessions, checks, values)
+            if why is None and len(sessions) >= 2 and str(c["filed"]) <= str(
+                    sessions[-2].date()):
+                why = f"filed {c['filed']}, before the last session (missed run): too late"
             if why is None and (sym in st.positions or sym in pending):
                 why = "already held or ordered"
             if why is None:
@@ -253,7 +258,7 @@ class InsiderEngine(Engine):
             items = [x.strip() for x in str(f.get("items", "")).split(",")]
             if "1.01" in items and "2.02" not in items:
                 t0 = first_open_after(sessions, when)
-                if t0 >= len(sessions) - n:
+                if t0 > len(sessions) - n:  # its 20-session window reaches our entry
                     return f"8-K 1.01 (contract or financing) on {pd.Timestamp(when).date()}"
             if "2.02" in items and bench is not None:
                 r = reaction_session(sessions, when)

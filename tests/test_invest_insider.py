@@ -293,3 +293,85 @@ def test_bot_waits_for_the_sec_index_then_trades(tmp_path, monkeypatch):
     assert bot.daily_job() is True
     assert [o["symbol"] for o in bot.state.pending] == [sym]
     assert bot.state.strategy == "insider" and bot.state.last_day == str(day.date())
+
+
+# ================================================================= review fixes
+def test_a_missing_sec_file_is_a_403_access_denied():
+    from invest.edgar import Edgar
+
+    class S3:
+        headers = {}
+
+        def get(self, url, timeout=None):
+            return type("R", (), {"status_code": 403, "text":
+                                  "<Error><Code>AccessDenied</Code></Error>"})()
+
+    e = Edgar(UA, cache_dir="/tmp/edgar_403", session=S3(), sleep=lambda s: None)
+    assert e.get("https://www.sec.gov/Archives/x.idx", allow_404=True) is None
+    with pytest.raises(FeedNotReady):
+        InsiderFeed(e).purchases_on(date(2026, 11, 11))
+
+
+def test_holidays_do_not_stall_the_bot(tmp_path):
+    bars = market()
+    sym = [k for k in bars if k not in ("SPY", "QQQ")][0]
+    idx = bars["SPY"].index
+    day = idx[60]
+    holiday = (day - pd.Timedelta(days=1)).date()
+
+    class Feed(StubFeed):
+        def purchases_on(self, d):
+            if d in (holiday, day.date()) and not self.ready.get(d):
+                raise FeedNotReady(f"no index for {d}")
+            return super().purchases_on(d)
+
+    feed = Feed([buy(sym, day, bars)])
+    feed.ready = {}
+    engine, state = insider_engine(tmp_path, [])
+    engine.feed = feed
+    state.insider_scanned = str((day - pd.Timedelta(days=2)).date())
+    evening = datetime.combine(day.date(), datetime.min.time()).replace(hour=21, tzinfo=ET)
+    with pytest.raises(FeedNotReady):  # today's index not out yet: wait
+        engine.prepare(day.date(), evening)
+    feed.ready[day.date()] = True  # today's index is out, yesterday's never will be
+    assert sym in engine.prepare(day.date(), evening.replace(hour=23))
+    next_morning = evening + pd.Timedelta(hours=10)  # 07:00: still missing = no filings
+    feed.ready[day.date()] = False
+    assert engine.prepare(day.date(), next_morning) == []
+
+
+def test_old_filings_from_a_missed_run_are_not_bought(tmp_path):
+    bars = market()
+    sym = [k for k in bars if k not in ("SPY", "QQQ")][0]
+    idx = bars["SPY"].index
+    engine, state = insider_engine(tmp_path, [buy(sym, idx[57], bars)])
+    state.insider_scanned = str(idx[56].date())
+    assert run_day(engine, bars, idx[60])["entries"] == []  # filed 3 sessions ago
+    skips = [x["message"] for x in engine.store.recent_decisions() if x["kind"] == "skip"]
+    assert any("too late" in m for m in skips)
+
+
+def test_contract_veto_lasts_exactly_20_sessions(tmp_path):
+    bars = market()
+    sym = [k for k in bars if k not in ("SPY", "QQQ")][0]
+    idx = bars["SPY"].index
+    day = idx[60]
+
+    def with_contract(k, sub):
+        when = datetime.combine(idx[k].date(), datetime.min.time()).replace(hour=7)
+        f = pd.DataFrame({"cik": [7], "accession": ["x"], "filed": [str(idx[k].date())],
+                          "items": ["1.01"], "raw_time": [""], "accepted_et": [when]})
+        engine, _ = insider_engine(tmp_path / sub, [buy(sym, day, bars)], eight_ks=f)
+        return run_day(engine, bars, day)["entries"]
+
+    # bought at the open of session 61: a contract first tradable at session t0 hurts
+    # sessions t0 .. t0+19 (the study's window)
+    assert with_contract(42, "a") == []  # window 42..61 covers our entry session
+    assert with_contract(41, "b") == [sym]  # window 41..60 ended before it
+
+
+def test_na_ticker_is_not_a_stock():
+    from invest.edgar import clean_symbol
+
+    assert clean_symbol("N/A") is None and clean_symbol("n/a.") is None
+    assert clean_symbol("NA") is None and clean_symbol("NNA") == "NNA"

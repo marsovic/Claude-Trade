@@ -132,6 +132,8 @@ def clean_symbol(text) -> str | None:
     s = text.strip().upper()
     if ":" in s:
         s = s.split(":")[-1].strip()
+    if s.rstrip(".") in ("", "NONE", "N.A", "NA", "N/A"):
+        return None
     s = re.split(r"[,;/\s]+", s)[0] if s else ""
     s = s.replace("-", ".")
     if s in ("", "NONE", "N.A", "NA", "N/A") or not re.fullmatch(r"[A-Z]{1,5}(\.[A-Z]{1,2})?", s):
@@ -185,8 +187,9 @@ class Edgar:
                     raise EdgarError(f"SEC unreachable: {exc}") from exc
                 self.sleep(2 ** attempt)
                 continue
-            if resp.status_code == 404 and allow_404:
-                return None
+            if allow_404 and (resp.status_code == 404 or (
+                    resp.status_code == 403 and "<Code>AccessDenied</Code>" in resp.text)):
+                return None  # the Archives are on S3: a missing file is a 403 AccessDenied
             # the SEC answers 403 "Request Rate Threshold Exceeded" or 429 when pushed
             if resp.status_code in (403, 429, 500, 502, 503, 504):
                 if resp.status_code == 403 and "threshold" not in resp.text.lower():
@@ -276,7 +279,9 @@ class Edgar:
         with contextlib.suppress(OSError, ValueError, KeyError):
             meta = json.loads(marker.read_text())
             fresh_from = str(until - timedelta(days=max_age_days))
-            if (meta["since"] <= str(since) and meta["fetched"] >= fresh_from
+            # max_age_days=0 (live decisions) always refetches: the cache date is the
+            # machine's local date, a day ahead of New York on a Mac in Europe at night
+            if (max_age_days > 0 and meta["since"] <= str(since) and meta["fetched"] >= fresh_from
                     and meta.get("version") == 2):
                 df = pd.read_csv(path, dtype=str, keep_default_na=False)
         if df is None:

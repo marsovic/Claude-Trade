@@ -50,8 +50,9 @@ scripts/macos/uninstall.sh          # stop both
 How the background mode works:
 - The bot starts at login and restarts if it crashes.
 - It keeps the Mac awake while it runs. A closed laptop lid still sleeps the Mac.
-- It reads the SEC filings of each session in the evening, New York time (after
-  22:00 in Paris), and places its orders for the next open.
+- It reads the SEC filings of each session after 22:00 New York time (about 04:00 in
+  Paris) and places its orders for the next open (15:30 in Paris). Leave the Mac on
+  and plugged in overnight.
 - Keep the project outside Documents, Desktop or Downloads. macOS blocks background
   programs there.
 
@@ -68,7 +69,7 @@ python -m invest.attention collect          # daily Reddit snapshot (cron)
 python -m invest.attention wiki --all-sec   # Wikipedia pageview history
 python -m invest.study --provider tiingo --days 3000   # momentum parameters
 python -m invest.backtest --provider massive --days 700 # momentum backtest
-python -m pytest                            # 347 tests, no network needed
+python -m pytest                            # 353 tests, no network needed
 ```
 
 ## Layout

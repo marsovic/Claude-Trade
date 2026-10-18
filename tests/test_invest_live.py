@@ -10,7 +10,7 @@ from invest.brokers.base import AccountInfo, BrokerPosition, LiveBroker, OrderUp
 from invest.data import ET, MarketData
 from invest.engine import Engine
 from invest.execution import LiveExecution
-from invest.invest_bot import EXIT_DEAD, BotIsDead, InvestBot, main
+from invest.invest_bot import BotIsDead, InvestBot, main
 from invest.portfolio import InvestPosition, InvestState
 from invest.tax import TaxLedger
 from tests.invest_helpers import SYMS, make_market, settings, signal_case
@@ -95,9 +95,16 @@ def live_engine(tmp_path, broker=None, **kw):
     return engine, ex, broker, state, store
 
 
+def next_open_clock(bars, day):
+    """Clock at 10:00 New York on the session after ``day`` (when planned orders go out)."""
+    nxt = bars["SPY"].index[bars["SPY"].index.get_loc(day) + 1]
+    return lambda: datetime(nxt.year, nxt.month, nxt.day, 10, 0, tzinfo=ET).timestamp()
+
+
 def test_planned_entry_submitted_filled_and_protected(tmp_path):
     bars, day, hits = signal_case()
     engine, ex, broker, state, store = live_engine(tmp_path)
+    ex.clock = next_open_clock(bars, day)
     engine.process_day(day, MarketData(bars=bars))
     assert state.pending and state.pending[0]["status"] == "planned"
     assert broker.orders == {}  # nothing sent before the open
@@ -144,6 +151,7 @@ def test_exit_cancels_stop_before_selling(tmp_path):
 def test_stale_entry_cancelled_and_manual_close_detected(tmp_path):
     engine, ex, broker, state, store = live_engine(tmp_path)
     bars, day, hits = signal_case()
+    ex.clock = next_open_clock(bars, day)
     engine.process_day(day, MarketData(bars=bars))
     ex.submit_planned(engine)
     pos = InvestPosition(symbol="ZZZ", qty=1, entry_price=10, cost_eur=9.1, initial_stop=9,
@@ -258,7 +266,7 @@ def test_bot_refuses_to_start_when_dead(tmp_path):
         bot.setup()
     code = main(["--state-dir", str(tmp_path), "--env-file", str(tmp_path / "none"),
                  "--once"])
-    assert code == EXIT_DEAD
+    assert code == 0  # dead and flat: exits cleanly, launchd does not restart it
 
 
 def test_cli_rejects_live_without_unlock(tmp_path, monkeypatch, capsys):
@@ -283,3 +291,15 @@ def test_live_bot_never_replays_history(tmp_path):
     bot.daily_job()
     assert bot.state.last_day == str(idx[-1].date())
     assert len(bot.state.equity_history) == 1  # only the latest close, never a replay
+
+
+def test_entry_that_missed_its_session_is_dropped(tmp_path):
+    """The bot was down on the session the entry was planned for: never buy a day late."""
+    bars, day, hits = signal_case()
+    engine, ex, broker, state, store = live_engine(tmp_path)
+    engine.process_day(day, MarketData(bars=bars))
+    later = bars["SPY"].index[bars["SPY"].index.get_loc(day) + 3]  # (a holiday may sit between)
+    ex.clock = lambda: datetime(later.year, later.month, later.day, 10, 0,
+                                tzinfo=ET).timestamp()
+    assert ex.submit_planned(engine) == 0 and broker.orders == {}
+    assert any("missed its session" in d["message"] for d in store.recent_decisions())

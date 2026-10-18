@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import logging
 import time
-from datetime import datetime
+from datetime import date, datetime
 
 import pandas as pd
 
@@ -35,7 +35,7 @@ from invest.brokers.base import (
 )
 from invest.brokers.sim import SimBroker
 from invest.data import ET
-from invest.markets import split_ratio
+from invest.markets import next_trading_day, split_ratio
 from invest.risk import stop_reason
 
 log = logging.getLogger("invest")
@@ -217,6 +217,11 @@ class LiveExecution:
                     continue
                 if self.state.last_day and o.day and o.day < self.state.last_day:
                     self._log("skip", f"entry planned on {o.day} is stale: dropped", o.symbol)
+                    continue
+                today = datetime.fromtimestamp(self.clock(), tz=ET).date()
+                if o.day and next_trading_day(date.fromisoformat(o.day)) < today:
+                    self._log("skip", f"entry planned on {o.day} missed its session: dropped",
+                              o.symbol)
                     continue
                 if o.reason == "entry" and o.symbol in self.state.positions:
                     continue

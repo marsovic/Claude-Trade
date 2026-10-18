@@ -13,6 +13,7 @@ set -euo pipefail
 BROKER="${1:-trading212}"
 case "$BROKER" in sim|trading212) ;; *) echo "usage: $0 [trading212|sim]"; exit 1 ;; esac
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
+cd "$REPO"
 PY="$REPO/.venv/bin/python"
 STATE="state_insider_${BROKER}"
 PORT="${DASHBOARD_PORT:-8051}"

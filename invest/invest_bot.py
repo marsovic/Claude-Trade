@@ -439,7 +439,7 @@ def main(argv=None) -> int:
         log.critical("This bot lost its capital on %s (%.2f EUR after %s trades). It will "
                      "never trade again. Archive or delete %s yourself to start a new life.",
                      t.get("died_at_iso"), t.get("equity", 0), t.get("trades"), s.state_dir)
-        return EXIT_DEAD
+        return 0  # dead and flat: nothing left to do (a background service stays stopped)
     except (ConfigError, BrokerError, RuntimeError) as exc:
         log.error("cannot start: %s", exc)
         return 1
