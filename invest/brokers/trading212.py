@@ -21,6 +21,7 @@ from __future__ import annotations
 import base64
 import logging
 import math
+import re
 import time
 
 import pandas as pd
@@ -45,6 +46,9 @@ MIN_INTERVAL = {  # seconds between calls, per endpoint family
     "stop": 2.1, "cancel": 1.3, "order": 1.1, "history": 10.5, "instruments": 51.0,
 }
 QTY_DECIMALS = 4  # the API rejects more precision than this on many instruments
+# a 400 "/api-errors/quantity-precision-mismatch" says how many decimals the instrument takes
+PRECISION_ERROR = re.compile(r"quantity-precision-mismatch.*?invalid quantity precision (\d+)",
+                             re.S)
 
 
 def floor_qty(qty: float, decimals: int = QTY_DECIMALS) -> float:
@@ -70,6 +74,7 @@ class Trading212Broker(LiveBroker):
         self.fx = fx or (lambda: 1.10)  # USD per EUR, used to convert USD fees
         self._last: dict[str, float] = {}
         self._instruments: dict[str, dict] | None = None
+        self._precision: dict[str, int] = {}  # learned from the API: decimals per ticker
         self._instruments_at = 0.0
         self._pending: dict[str, dict] = {}
         self._history: list[dict] | None = None
@@ -162,10 +167,26 @@ class Trading212Broker(LiveBroker):
         return AccountInfo(equity_eur=equity, cash_eur=cash_eur, positions=positions)
 
     # --------------------------------------------------------------- orders
+    def _qty(self, order: OrderRequest) -> float:
+        return floor_qty(order.qty, self._precision.get(order.broker_ticker, QTY_DECIMALS))
+
     def submit(self, order: OrderRequest) -> str:
+        """Send an order; when the instrument takes fewer decimals than sent, learn its
+        precision from the error, round the quantity down and send it once more."""
+        try:
+            return self._submit(order)
+        except BrokerError as exc:
+            m = PRECISION_ERROR.search(str(exc))
+            current = self._precision.get(order.broker_ticker, QTY_DECIMALS)
+            if not m or int(m.group(1)) >= current:
+                raise
+            self._precision[order.broker_ticker] = int(m.group(1))
+            return self._submit(order)
+
+    def _submit(self, order: OrderRequest) -> str:
         if not order.broker_ticker:
             raise BrokerError(f"{order.symbol}: no Trading 212 ticker")
-        qty = floor_qty(order.qty)
+        qty = self._qty(order)
         if qty <= 0:
             raise BrokerError(f"{order.symbol}: quantity {order.qty} rounds to zero")
         signed = qty if order.side == "BUY" else -qty
@@ -241,7 +262,7 @@ class Trading212Broker(LiveBroker):
 
     def find(self, order: OrderRequest, submitted_at: int) -> str | None:
         """Match a timed-out submission by ticker, signed quantity and type."""
-        qty = floor_qty(order.qty)
+        qty = self._qty(order)
         signed = qty if order.side == "BUY" else -qty
         kind = {"MARKET": "MARKET", "LIMIT": "LIMIT", "STOP": "STOP"}[order.kind]
 

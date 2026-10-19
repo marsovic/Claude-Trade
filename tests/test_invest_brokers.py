@@ -268,3 +268,22 @@ def test_ibkr_whole_shares_and_reconcile(monkeypatch):
     assert upd.status == "filled" and upd.fees_eur == pytest.approx(1.0)
     acct = b.account()
     assert acct.equity_eur == 101.5 and acct.positions["AMD"].price == 155.0
+
+
+def test_t212_learns_the_quantity_precision_of_an_instrument():
+    """Trading 212 takes 2 or 3 decimals on some stocks: learn it, round down, resend."""
+    refused = Resp(400, {"type": "/api-errors/quantity-precision-mismatch",
+                         "title": "Error while placing the order", "status": 400,
+                         "detail": "invalid quantity precision 2"})
+    b = t212({("POST", "/equity/orders/limit"): [refused, Resp(200, {"id": 7}),
+                                                 Resp(200, {"id": 8})]})
+    order = OrderRequest("BYRN", "BUY", 4.09028, kind="LIMIT", limit_price=5.0,
+                         broker_ticker="BYRN_US_EQ")
+    assert b.submit(order) == "7"
+    sent = [c[2]["quantity"] for c in b.session.calls]
+    assert sent == [4.0902, 4.09]  # 4 decimals refused, 2 accepted
+    assert b.submit(order) == "8" and b.session.calls[-1][2]["quantity"] == 4.09  # remembered
+    other = t212({("POST", "/equity/orders/limit"): Resp(400, {"detail": "insufficient funds"})})
+    with pytest.raises(BrokerError):  # any other refusal is not retried
+        other.submit(order)
+    assert len(other.session.calls) == 1
