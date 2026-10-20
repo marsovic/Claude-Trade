@@ -86,3 +86,21 @@ def test_journal_tail_reads_last_entries_in_order(tmp_path):
     last = store.recent_decisions(10)
     assert [d["message"].split()[1] for d in last] == [str(i) for i in range(2990, 3000)]
     assert len(store.recent_decisions(5000)) == 3000
+
+
+def test_dashboard_token_and_cors_for_a_phone_app(tmp_path):
+    from dashboard.dashboard import create_app
+
+    client = create_app(tmp_path, token="s3cret", cors_origins="https://app.example").test_client()
+    assert client.get("/api/state").status_code == 401
+    assert client.get("/api/state?token=nope").status_code == 401
+    ok = client.get("/api/state", headers={"Authorization": "Bearer s3cret",
+                                           "Origin": "https://app.example"})
+    assert ok.status_code == 200
+    assert ok.headers["Access-Control-Allow-Origin"] == "https://app.example"
+    pre = client.options("/api/state", headers={"Origin": "https://app.example"})
+    assert pre.status_code == 204 and "Authorization" in pre.headers[
+        "Access-Control-Allow-Headers"]
+    other = client.get("/api/state?token=s3cret", headers={"Origin": "https://evil.example"})
+    assert "Access-Control-Allow-Origin" not in other.headers
+    assert client.get("/").status_code == 200  # the page loads; it sends the token itself

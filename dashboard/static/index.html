@@ -526,7 +526,9 @@ function buildFilters() {
 
 async function refresh() {
   try {
-    const resp = await fetch("api/state", {cache: "no-store"});
+    const token = new URLSearchParams(location.hash.slice(1)).get("token");
+    const resp = await fetch("api/state", {cache: "no-store",
+      headers: token ? {Authorization: "Bearer " + token} : {}});
     if (!resp.ok) throw new Error(resp.status);
     render(await resp.json());
   } catch (err) {

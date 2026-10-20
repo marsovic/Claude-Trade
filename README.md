@@ -47,6 +47,9 @@ tail -f ~/Library/Logs/claude-trade/bot.log
 scripts/macos/uninstall.sh          # stop both
 ```
 
+On the phone: the same dashboard through Tailscale, or a custom app built with Google
+AI Studio from a ready-made prompt. See [docs/APP_MOBILE.md](docs/APP_MOBILE.md).
+
 How the background mode works:
 - The bot starts at login and restarts if it crashes.
 - It keeps the Mac awake while it runs. A closed laptop lid still sleeps the Mac.
