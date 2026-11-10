@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.1.0 — 2026-11-10
+
+- Insider bot: by default only CEO/CFO purchases are bought and positions are sold after
+  5 sessions instead of 20 (`INV_INSIDER_RULES`, `INV_INSIDER_HOLD_DAYS`): README_INVEST.md,
+  "Which rule, how long".
+- Each position shows its session count and sale date (dashboard and journal).
+- Trading 212: the quantity precision of each instrument is learned from the API.
+- Dashboard: optional token and CORS for phone access (docs/APP_MOBILE.md).
+
 ## 1.0.0 — 2026-10-18
 
 First release.

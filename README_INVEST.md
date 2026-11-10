@@ -379,7 +379,9 @@ How the tool treats such cases:
 
 ### Trading it: the insider bot (`invest/insider.py`, `INV_STRATEGY=insider`)
 
-The bot trades the validated rules with the same thresholds as the study.
+The bot trades the validated rules with the same thresholds as the study. By default
+it keeps only the strongest one (`ceo_cfo`) and holds 5 sessions; see "Which rule, how
+long" below.
 
 Each US session, once the SEC has published that day's filings (about 22:00 New York time, 04:00 in Paris):
 
@@ -401,7 +403,30 @@ Each US session, once the SEC has published that day's filings (about 22:00 New 
    - limit at the last close + 8 %;
    - equal weight across `INV_INSIDER_SLOTS` (4: about 25 € each);
    - disaster stop at −35 % (the study had no stop).
-5. **Sell** at the open after 20 sessions (`INV_INSIDER_HOLD_DAYS`).
+5. **Sell** at the open after `INV_INSIDER_HOLD_DAYS` sessions (5 by default, one week).
+   The dashboard shows each position's session count and sale date. Nothing else closes
+   a position: no take-profit, no trailing stop.
+
+#### Which rule, how long (from `study_events_massive/events.csv`)
+
+Net return of a trade against similar stocks, after costs (design / locked period):
+
+| Rule | 5 sessions | 20 sessions | Per day of a slot (5 vs 20) |
+|---|---|---|---|
+| `ceo_cfo` | **+0.63 % / +0.80 %** (p = 0.03 / 0.06) | +0.90 % / +1.12 % (p = 0.04 / 0.05) | **+0.13-0.16 %** vs +0.05 % |
+| `conviction` | +0.21 % / −0.12 % | +0.29 % / +1.01 % | about 0 vs +0.01-0.05 % |
+| `buy` | +0.17 % / +0.05 % | +0.37 % / +0.40 % | about 0 vs +0.02 % |
+
+- Only `ceo_cfo` clearly beats similar stocks net of costs, in both periods. The other two
+  passed the study's test (better than the same stocks' ordinary days) but a trade nets
+  about zero against peers, and each one blocks a slot.
+- Most of the CEO/CFO effect comes in the first 5 sessions. With 4 slots, a 5-session
+  hold earns about 3 times more per slot-day and gives 4 times more trades.
+- Limits: the 5-session figures were not put through the placebo and Holm tests, and
+  the gain is carried by a few big winners (without the 10 best stocks a trade nets about
+  zero). A shorter hold also pays costs 4 times more often: if real spreads exceed the
+  model by more than about 0.5 %, the advantage is gone. The demo will tell.
+- To go back: `INV_INSIDER_RULES=ceo_cfo,conviction,buy` and `INV_INSIDER_HOLD_DAYS=20`.
 
 Survival rule, weekly loss pause and fee halt are unchanged. The dashboard shows every
 candidate of the day with its checks, and the journal says why each one was or was not

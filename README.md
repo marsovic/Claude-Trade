@@ -7,7 +7,7 @@ passing them.
 
 | Part | What it does | Status |
 |---|---|---|
-| **Insider bot** (`invest/insider.py`) | Buys a US stock after its CEO, CFO or another officer bought shares on the open market (SEC Form 4); sells 20 sessions later. Avoids stocks that just signed a financing/contract 8-K or fell on their results | **the only validated rule**: run it on the Trading 212 demo first |
+| **Insider bot** (`invest/insider.py`) | Buys a US stock after its CEO or CFO bought shares on the open market (SEC Form 4); sells 5 sessions later. Avoids stocks that just signed a financing/contract 8-K or fell on their results | **the only validated rule**: run it on the Trading 212 demo first |
 | Event study (`invest/events.py`) | Tests announcement and attention rules on every US stock, delisted ones included, without look-ahead | research |
 | Attention data (`invest/attention.py`) | Daily Reddit snapshots (ApeWisdom), Wikipedia pageview history | research |
 | Momentum bot (`invest/engine.py`) | The original 7-condition breakout bot | no edge found: paper only |
@@ -90,7 +90,7 @@ data_*/      cached market and SEC data
 
 ## Résumé en français
 
-- **V1.** Le bot recommandé achète une action US après un achat d'actions par son PDG, son directeur financier ou un dirigeant (déclaration SEC « Form 4 »). Il revend 20 séances plus tard.
+- **V1.** Le bot recommandé achète une action US après un achat d'actions par son PDG ou son directeur financier (déclaration SEC « Form 4 »). Il revend 5 séances plus tard.
 - **C'est la seule règle validée** sur toutes les actions US, disparues comprises (2024-2026) : +1,7 % puis +2,3 % de mieux que la normale par trade, après frais.
 - **Lancement en arrière-plan sur Mac** : `scripts/macos/install.sh`, puis le tableau de bord sur http://127.0.0.1:8051.
 - **Toujours en démo d'abord.** L'argent réel reste verrouillé : il faut l'accord écrit de Trading 212.

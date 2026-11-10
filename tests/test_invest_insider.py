@@ -155,6 +155,8 @@ def buy(sym, day, bars, **kw):
 
 
 def insider_engine(tmp_path, rows, eight_ks=None, **kw):
+    kw.setdefault("insider_hold_days", 20)  # the mechanics are tested on the long hold
+    kw.setdefault("insider_rules", ["ceo_cfo", "conviction", "buy"])
     s = settings(state_dir=str(tmp_path), strategy="insider", sec_user_agent=UA, **kw)
     state = InvestState.fresh("sim", s.initial_capital)
     store = StateStore(tmp_path, InvestState)
@@ -380,3 +382,19 @@ def test_na_ticker_is_not_a_stock():
 
     assert clean_symbol("N/A") is None and clean_symbol("n/a.") is None
     assert clean_symbol("NA") is None and clean_symbol("NNA") == "NNA"
+
+
+def test_defaults_are_ceo_cfo_buys_held_one_week(tmp_path):
+    s = settings(strategy="insider", sec_user_agent=UA)
+    assert s.insider_rules == ["ceo_cfo"] and s.insider_hold_days == 5
+    bars = market()
+    sym, other = [k for k in bars if k not in ("SPY", "QQQ")][:2]
+    idx = bars["SPY"].index
+    rows = [buy(sym, idx[60], bars),
+            buy(other, idx[60], bars, role="director", officer=False, director=True)]
+    engine, state = insider_engine(tmp_path, rows, insider_hold_days=5,
+                                   insider_rules=["ceo_cfo"])
+    assert run_day(engine, bars, idx[60])["entries"] == [sym]  # the director's buy is ignored
+    for k in range(61, 65):
+        assert run_day(engine, bars, idx[k])["exits"] == []
+    assert run_day(engine, bars, idx[65])["exits"] == [sym]  # sold at the open of session 66

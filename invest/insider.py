@@ -1,9 +1,12 @@
-"""Insider strategy: buy after an officer's open-market purchase, sell 20 sessions later.
+"""Insider strategy: buy after a CEO/CFO open-market purchase, sell a week later.
 
 It trades the rule validated by ``python -m invest.events --prices massive`` on every US
 stock, delisted ones included (README_INVEST.md, section 7).  Over 2024-10 to 2026-10, a
 CEO or CFO buying at least 50 k$ of shares was followed by +2.3 % / +2.9 % over 20
 sessions against the same stocks' ordinary days, net of costs, in both test periods.
+Against similar stocks, a trade netted +0.6 % / +0.8 % after 5 sessions and +0.9 % /
++1.1 % after 20: the default holds 5 (INV_INSIDER_HOLD_DAYS), which uses a slot about
+three times better. The other two rules did not clearly beat similar stocks net of costs.
 
 For each US session D, processed once the SEC has published D's daily index (late
 evening, New York time):
@@ -18,7 +21,7 @@ evening, New York time):
    free slot;
 4. buy at the next open with a limit at the last close + 8 %, equal weight across
    INV_INSIDER_SLOTS, with a disaster stop at -35 % (the study had no stop);
-5. sell at the open after 20 sessions.
+5. sell at the open after INV_INSIDER_HOLD_DAYS sessions (5 by default).
 
 The survival rule, the weekly loss pause and the fee halt of the momentum bot still apply.
 """

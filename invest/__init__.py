@@ -3,4 +3,4 @@
 Starts with 100 EUR. If it loses them, it stops forever.
 """
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"

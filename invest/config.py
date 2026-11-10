@@ -191,9 +191,14 @@ class InvestSettings:
     # momentum: the original 7-condition breakout bot (no edge found, README_INVEST s.6)
     # insider: buys after SEC insider purchases, the rule validated by invest.events (s.7)
     strategy: str = "momentum"
-    insider_rules: list[str] = field(default_factory=lambda: ["ceo_cfo", "conviction", "buy"])
+    # ceo_cfo is the only rule whose trades beat similar stocks NET of costs in both test
+    # periods (README_INVEST.md s.7); "conviction" and "buy" can be added back
+    insider_rules: list[str] = field(default_factory=lambda: ["ceo_cfo"])
     insider_slots: int = 4  # equal-weight positions
-    insider_hold_days: int = 20  # sessions, as measured by the event study
+    # sessions held. The study measured 5 and 20: most of the CEO/CFO effect comes in the
+    # first 5 (+0.6 % to +0.8 % net a trade, against +0.9 % to +1.1 % for 20), so a slot
+    # earns about 3 times more per day, and a demo gives 4 times more trades to judge it
+    insider_hold_days: int = 5
     insider_stop_pct: float = 0.35  # disaster stop only: the study had no stop
     insider_entry_gap: float = 0.08  # buy limit = last close * (1 + gap)
     insider_min_price: float = 2.0  # USD, last close

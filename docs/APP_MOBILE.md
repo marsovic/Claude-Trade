@@ -97,7 +97,7 @@ Crée une application web mobile (React + TypeScript, mobile-first, utilisable e
 ## Le robot (contexte)
 - Il démarre avec 100 € sur un compte démo Trading 212. S'il descend à 10 €, il s'arrête définitivement (« règle de survie »).
 - Stratégie « insider » : chaque nuit, il lit les déclarations SEC Form 4 de la veille, c'est-à-dire les achats d'actions par les dirigeants. Il garde les achats sur le marché du PDG ou du directeur financier (≥ 50 000 $), les gros achats (≥ 100 000 $ et +20 % de sa ligne) et les achats de dirigeants ou d'administrateurs (≥ 25 000 $). Il vérifie chaque candidat : prix ≥ 2 $, ≥ 1 M$ échangés par jour, prix déclaré cohérent avec le marché, pas d'annonce de contrat ou de financement (8-K 1.01) ni de chute après résultats dans les 20 dernières séances, action disponible sur Trading 212, place libre (4 positions maximum).
-- Il achète à l'ouverture suivante (15 h 30, heure de Paris), avec un stop de sécurité à -35 %, et revend après 20 séances.
+- Il achète à l'ouverture suivante (15 h 30, heure de Paris), avec un stop de sécurité à -35 %, et revend après 5 séances (réglable : settings.insider_hold_days).
 
 ## Source des données
 - Une seule requête : GET {baseUrl}/api/state avec l'en-tête « Authorization: Bearer {token} ».
@@ -146,7 +146,7 @@ Crée une application web mobile (React + TypeScript, mobile-first, utilisable e
       ],
       "signals": ["BYRN"]
     },
-    "settings": {"insider_slots": 4, "insider_hold_days": 20, "insider_stop_pct": 0.35,
+    "settings": {"insider_slots": 4, "insider_hold_days": 5, "insider_stop_pct": 0.35,
                  "survival_floor": 10.0}
   },
   "decisions": [   // journal, le plus récent en premier
@@ -173,7 +173,7 @@ Les champs inconnus doivent être ignorés sans planter. Les nombres peuvent êt
    - le prix d'entrée et le dernier prix ;
    - le P&L latent en € et en % ;
    - le stop ;
-   - le jour d'entrée, avec « séance X / 20 » estimée en jours ouvrés depuis entry_day ;
+   - le jour d'entrée, avec « séance X / N » et la date de vente (champs sessions_held, hold_sessions et exit_day de la position) ;
    - une barre de progression vers la sortie.
 
    Afficher aussi les ordres en attente (pending) : « Achat prévu à l'ouverture ».
