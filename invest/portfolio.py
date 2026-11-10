@@ -42,6 +42,9 @@ class InvestPosition:
     take_profit: float | None = None  # momentum exits have no fixed target
     unrealized_eur: float = 0.0
     last_price: float = 0.0
+    sessions_held: int = 0  # insider strategy: sessions since the entry (dashboard)
+    hold_sessions: int = 0  # ... out of this many
+    exit_day: str = ""  # ... and the session at whose open it is sold (YYYY-MM-DD)
 
     def __post_init__(self):
         if not self.highest:

@@ -44,6 +44,7 @@ from invest.events import (
     first_open_after,
     reaction_session,
 )
+from invest.markets import next_trading_day
 
 log = logging.getLogger("invest")
 
@@ -57,6 +58,13 @@ MAX_CATCH_UP = 10  # business days of filings read at most after a long stop
 # the SEC publishes a day's index at about 22:02 New York time; still missing 8 hours later
 # (before the open), or missing for an older day: a holiday, no filings
 INDEX_GRACE = timedelta(hours=8)
+
+
+def add_sessions(d: date, n: int) -> date:
+    """The NYSE session ``n`` sessions after day ``d``."""
+    for _ in range(n):
+        d = next_trading_day(d)
+    return d
 
 
 def matching_rules(row, allowed) -> list[str]:
@@ -131,7 +139,10 @@ class InsiderEngine(Engine):
         exiting = set()
         for sym, pos in list(st.positions.items()):
             held = int(((sessions > pd.Timestamp(pos.entry_day)) & (sessions <= day)).sum())
-            if held >= s.insider_hold_days - 1:  # sold at the next open: 20 sessions held
+            left = s.insider_hold_days - 1 - held  # nightly runs before the sale is queued
+            pos.sessions_held, pos.hold_sessions = held + 1, s.insider_hold_days
+            pos.exit_day = str(add_sessions(day.date(), max(left, 0) + 1))
+            if left <= 0:  # sold at the next open: the full holding period is over
                 exiting.add(sym)
                 self._exit(sym, pos, f"time exit ({held + 1} sessions held)", day)
 
@@ -194,9 +205,10 @@ class InsiderEngine(Engine):
                                  risk_eur=notional * s.insider_stop_pct, day=str(day.date()))
             if not self.exec.queue(self, order):
                 continue
+            sale = add_sessions(day.date(), s.insider_hold_days + 1)
             self._log("order", f"{label}. BUY {qty:g} at the next open, limit {limit:.4g} "
                       f"({notional:.2f} EUR), disaster stop -{s.insider_stop_pct:.0%}, sold "
-                      f"after {s.insider_hold_days} sessions", sym)
+                      f"after {s.insider_hold_days} sessions (at the open of {sale})", sym)
             free -= 1
             cash -= notional * (1 + s.insider_entry_gap)
             entered.append(sym)

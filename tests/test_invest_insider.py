@@ -184,6 +184,11 @@ def test_insider_buy_is_bought_next_open_and_sold_after_20_sessions(tmp_path):
     assert pos.entry_day == str(idx[61].date())
     assert pos.stop_loss == pytest.approx(pos.entry_price * 0.65)
     assert pos.cost_eur == pytest.approx(25.0, rel=0.05)  # 100 EUR / 4 slots
+    assert (pos.sessions_held, pos.hold_sessions) == (1, 20)
+    # the dashboard shows when it is sold: 20 NYSE sessions after the entry session
+    # (the synthetic market trades on Good Friday, the real calendar does not)
+    from invest.insider import add_sessions
+    assert pos.exit_day == str(add_sessions(idx[61].date(), 20))
     for k in range(62, 80):
         run_day(engine, bars, idx[k])
     assert sym in state.positions and not state.pending  # 19 sessions: still held

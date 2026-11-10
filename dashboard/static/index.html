@@ -374,7 +374,7 @@ function renderSentiment(s) {
 function renderPositions(positions, marks) {
   const body = $("positions");
   if (!positions.length) {
-    body.replaceChildren(row([{text: "No open position — waiting for 7/7 alignment.", cls: "muted"}]));
+    body.replaceChildren(row([{text: "No open position.", cls: "muted"}]));
     body.firstChild.firstChild.colSpan = 11;
     return;
   }
@@ -390,7 +390,8 @@ function renderPositions(positions, marks) {
       {text: px(p.stop_loss), cls: "num"}, {text: px(p.take_profit), cls: "num"},
       {text: fmt(p.risk_amount) + " " + CUR, cls: "num"},
       {text: upnl === null ? "—" : signed(upnl) + " " + CUR, cls: "num " + cls(upnl)},
-      {text: datetime(p.opened_at)},
+      {text: datetime(p.opened_at) + (p.exit_day
+        ? ` · day ${p.sessions_held}/${p.hold_sessions}, sells ${p.exit_day}` : "")},
     ]);
   }));
 }
