@@ -23,7 +23,15 @@ LOGS="$HOME/Library/Logs/claude-trade"
 AGENTS="$HOME/Library/LaunchAgents"
 DOMAIN="gui/$(id -u)"
 
-[ -x "$PY" ] || { echo "No $PY. Create it: cd $REPO && python3 -m venv .venv && .venv/bin/pip install -r requirements.txt"; exit 1; }
+[ -x "$PY" ] || { echo "No $PY. Create it: cd $REPO && python3 -m venv --clear .venv && .venv/bin/python -m pip install -r requirements.txt"; exit 1; }
+# the packages must be in THIS virtualenv: without them the bot cannot even read .env
+missing="$("$PY" -c 'import importlib.util as u; print(" ".join(p for m, p in (("dotenv", "python-dotenv"), ("flask", "flask"), ("pandas", "pandas"), ("numpy", "numpy"), ("requests", "requests")) if u.find_spec(m) is None))')"
+if [ -n "$missing" ]; then
+  echo "Packages missing in $REPO/.venv: $missing"
+  echo "Install them:   .venv/bin/python -m pip install -r requirements.txt"
+  echo "If that fails, rebuild the environment first:   python3 -m venv --clear .venv"
+  exit 1
+fi
 [ -f "$REPO/.env" ] || { echo "No $REPO/.env: copy .env.example and fill it"; exit 1; }
 case "$REPO" in
   "$HOME/Documents"*|"$HOME/Desktop"*|"$HOME/Downloads"*)

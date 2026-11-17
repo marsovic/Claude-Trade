@@ -104,3 +104,18 @@ def test_dashboard_token_and_cors_for_a_phone_app(tmp_path):
     other = client.get("/api/state?token=s3cret", headers={"Origin": "https://evil.example"})
     assert "Access-Control-Allow-Origin" not in other.headers
     assert client.get("/").status_code == 200  # the page loads; it sends the token itself
+
+
+def test_env_file_is_never_ignored_silently(tmp_path, monkeypatch):
+    """Without python-dotenv the .env used to be skipped and every key looked empty."""
+    import bot.config
+    import invest.config
+
+    env = tmp_path / ".env"
+    env.write_text("SEC_USER_AGENT=someone@example.com\n")
+    for module, cls in ((invest.config, invest.config.InvestSettings),
+                        (bot.config, bot.config.Settings)):
+        monkeypatch.setattr(module, "load_dotenv", None)
+        with pytest.raises(module.ConfigError, match="python-dotenv is missing"):
+            cls.from_env(str(env))
+        cls.from_env(str(tmp_path / "absent.env"))  # no file: nothing to read, no error

@@ -172,7 +172,13 @@ class Settings:
     @classmethod
     def from_env(cls, env_file: str | None = ".env", *, require_credentials: bool = True,
                  **overrides) -> Settings:
-        if env_file and load_dotenv is not None and Path(env_file).exists():
+        if env_file and Path(env_file).exists():
+            if load_dotenv is None:
+                # never ignore the file silently: every setting would look empty
+                raise ConfigError(
+                    f"cannot read {env_file}: the project's packages are not installed in "
+                    "this Python environment (python-dotenv is missing). Install them with "
+                    "that environment's python: python -m pip install -r requirements.txt")
             load_dotenv(env_file, override=False)
         values: dict = {}
         for f in fields(cls):
