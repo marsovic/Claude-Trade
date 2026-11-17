@@ -124,7 +124,7 @@ def main(argv=None) -> int:
     p = argparse.ArgumentParser(description="Survival trading bot dashboard")
     p.add_argument("--state-dir", default=os.environ.get("STATE_DIR", "state"))
     p.add_argument("--host", default=os.environ.get("DASHBOARD_HOST", "127.0.0.1"))
-    p.add_argument("--port", type=int, default=int(os.environ.get("DASHBOARD_PORT", "8050")))
+    p.add_argument("--port", type=int, default=int(os.environ.get("DASHBOARD_PORT") or "8050"))
     p.add_argument("--token", default=os.environ.get("DASHBOARD_TOKEN", ""),
                    help="require this token on /api/state (remote access)")
     p.add_argument("--cors-origin", default=os.environ.get("DASHBOARD_CORS_ORIGIN", ""),

@@ -94,6 +94,10 @@ write_agent com.claudetrade.dashboard dashboard 10 \
   "$PY" "$REPO/dashboard/dashboard.py" --state-dir "$STATE" --port "$PORT"
 
 echo
+echo "checking that both started..."
+sleep 3
+"$REPO/scripts/macos/status.sh" || true
+echo
 echo "Dashboard:  http://127.0.0.1:$PORT   (open it in Safari or Chrome)"
 echo "Bot log:    tail -f $LOGS/bot.log"
 echo "Status:     scripts/macos/status.sh"
