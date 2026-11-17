@@ -44,8 +44,12 @@ cp .env.example .env    # then fill at least: MASSIVE_API_KEY, SEC_USER_AGENT,
 scripts/macos/install.sh            # or: scripts/macos/install.sh sim
 open http://127.0.0.1:8051          # the dashboard
 tail -f ~/Library/Logs/claude-trade/bot.log
+scripts/macos/status.sh             # are they running? last log lines
 scripts/macos/uninstall.sh          # stop both
 ```
+
+After each `git pull`, run `scripts/macos/install.sh` again: it restarts both with the
+new code and keeps positions and journal.
 
 On the phone: the same dashboard through Tailscale, or a custom app built with Google
 AI Studio from a ready-made prompt. See [docs/APP_MOBILE.md](docs/APP_MOBILE.md).

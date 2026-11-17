@@ -4,6 +4,8 @@
 #   scripts/macos/install.sh              # Trading 212 DEMO account (default)
 #   scripts/macos/install.sh sim          # simulator, no broker
 #
+# Run it again after every `git pull`: it restarts both with the new code (positions and
+# journal are kept). No need to activate the virtualenv first.
 # Both start now and at every login, and restart if they crash. The Mac is kept awake
 # while the bot runs (caffeinate), but a closed laptop lid still puts it to sleep.
 # Dashboard: http://127.0.0.1:8051   Logs: ~/Library/Logs/claude-trade/
@@ -46,8 +48,8 @@ PY
 
 mkdir -p "$LOGS" "$AGENTS"
 
-write_agent() {  # label, log name, program arguments...
-  local label="$1" logname="$2"; shift 2
+write_agent() {  # label, log name, seconds between two restarts, program arguments...
+  local label="$1" logname="$2" throttle="$3"; shift 3
   local plist="$AGENTS/$label.plist" args=""
   for a in "$@"; do args="$args    <string>$a</string>
 "; done
@@ -68,25 +70,31 @@ $args  </array>
   </dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
-  <key>ThrottleInterval</key><integer>900</integer>
+  <key>ThrottleInterval</key><integer>$throttle</integer>
   <key>StandardOutPath</key><string>$LOGS/$logname.log</string>
   <key>StandardErrorPath</key><string>$LOGS/$logname.log</string>
 </dict>
 </plist>
 PLIST
+  # stop the old instance and wait until launchd has let go of it: loading the new one
+  # too early fails with "Bootstrap failed: 5: Input/output error"
   launchctl bootout "$DOMAIN/$label" 2>/dev/null || true
-  launchctl bootstrap "$DOMAIN" "$plist"
+  for _ in $(seq 1 30); do
+    launchctl print "$DOMAIN/$label" >/dev/null 2>&1 || break
+    sleep 1
+  done
+  launchctl bootstrap "$DOMAIN" "$plist" || { sleep 5; launchctl bootstrap "$DOMAIN" "$plist"; }
   echo "started $label"
 }
 
-write_agent com.claudetrade.insider-bot bot \
+write_agent com.claudetrade.insider-bot bot 60 \
   /usr/bin/caffeinate -i "$PY" -m invest.invest_bot --strategy insider \
   --broker "$BROKER" --environment paper --state-dir "$STATE"
-write_agent com.claudetrade.dashboard dashboard \
+write_agent com.claudetrade.dashboard dashboard 10 \
   "$PY" "$REPO/dashboard/dashboard.py" --state-dir "$STATE" --port "$PORT"
 
 echo
 echo "Dashboard:  http://127.0.0.1:$PORT   (open it in Safari or Chrome)"
 echo "Bot log:    tail -f $LOGS/bot.log"
-echo "Status:     launchctl list | grep claudetrade"
+echo "Status:     scripts/macos/status.sh"
 echo "Stop all:   scripts/macos/uninstall.sh"
